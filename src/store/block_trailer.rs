@@ -122,9 +122,20 @@ pub fn write_block_trailer<W: Write + ?Sized>(
 ) -> io::Result<()> {
     let mut body = Vec::new();
     remap.serialize_body(&mut body)?;
-    // body.len() + 4 fits comfortably in u32 — even a 100 KB remap is
-    // ~25K entries.
-    let trailer_byte_len = (body.len() + 4) as u32;
+    // body.len() + 4 is the on-disk trailer length, encoded as a u32. A
+    // remap > 4GB is implausible but a silent `as u32` truncation would
+    // corrupt the trailer (reader subtracts a wrapped length from
+    // block.len()); fail-loud via try_from instead.
+    let trailer_byte_len = u32::try_from(body.len() + 4).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "V3 block trailer body of {} bytes exceeds u32::MAX - 4; \
+                 split the remap or rebuild without stack_with_remap",
+                body.len()
+            ),
+        )
+    })?;
     writer.write_all(&body)?;
     trailer_byte_len.serialize(writer)?;
     Ok(())

@@ -208,9 +208,13 @@ impl BlockCompressorImpl {
                 ),
             ));
         }
-        if store_reader.doc_store_version() >= DocStoreVersion::V3 {
-            // V3 source: blocks already carry trailers — bulk byte-copy.
-            let doc_shift = self.first_doc_in_block;
+        let source_version = store_reader.doc_store_version();
+        let output_v3 = self.output_version >= DocStoreVersion::V3;
+        let source_v3 = source_version >= DocStoreVersion::V3;
+        let doc_shift = self.first_doc_in_block;
+
+        if source_v3 && output_v3 {
+            // V3 → V3: blocks already carry trailers; bulk byte-copy.
             let start_shift = self.writer.written_bytes() as usize;
             self.writer
                 .write_all(store_reader.block_data()?.as_slice())?;
@@ -224,17 +228,29 @@ impl BlockCompressorImpl {
             return Ok(());
         }
 
-        // V1/V2 source: per-block stack so we can append an empty V3 trailer
-        // after each compressed payload. The compressed bytes pass through
-        // unchanged; only the (4-byte) trailer is injected.
-        let doc_shift = self.first_doc_in_block;
+        // Per-block walk for every other combination so we can strip or
+        // inject the trailer to match `self.output_version`:
+        //   V2 → V3: write empty trailer after each compressed payload
+        //   V3 → V2: strip the source's trailer before writing
+        //   V2 → V2: byte-copy each block as-is (no trailer either side)
         let source_block_data = store_reader.block_data()?;
         let source_checkpoints: Vec<Checkpoint> = store_reader.block_checkpoints().collect();
         for checkpoint in source_checkpoints {
-            let compressed_payload = source_block_data.slice(checkpoint.byte_range.clone());
+            let block_bytes = source_block_data.slice(checkpoint.byte_range.clone());
+            // Strip the source's trailer if it has one.
+            let compressed_payload = if source_v3 {
+                let (_, trailer_len) =
+                    crate::store::read_block_trailer(block_bytes.as_ref())?;
+                let payload_end = block_bytes.len() - trailer_len;
+                block_bytes.slice(0..payload_end)
+            } else {
+                block_bytes
+            };
             let start_offset = self.writer.written_bytes() as usize;
             self.writer.write_all(compressed_payload.as_slice())?;
-            write_block_trailer(&mut self.writer, &BlockFieldRemap::default())?;
+            if output_v3 {
+                write_block_trailer(&mut self.writer, &BlockFieldRemap::default())?;
+            }
             let end_offset = self.writer.written_bytes() as usize;
             self.register_checkpoint(Checkpoint {
                 doc_range: (checkpoint.doc_range.start + doc_shift)
@@ -254,6 +270,21 @@ impl BlockCompressorImpl {
         store_reader: StoreReader,
         user_remap: BlockFieldRemap,
     ) -> io::Result<()> {
+        // `stack_with_remap` writes a per-block V3 trailer carrying the
+        // composed remap — the whole point of the API. A V2 target can't
+        // express a trailer, so refuse rather than silently drop the
+        // translation.
+        if self.output_version < DocStoreVersion::V3 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "stack_with_remap requires a V3+ target (output_version \
+                     is {}); use the V3 default writer or rebuild via a \
+                     doc-by-doc copy if you need V2 output.",
+                    self.output_version
+                ),
+            ));
+        }
         let doc_shift = self.first_doc_in_block;
         let source_block_data = store_reader.block_data()?;
         let source_version = store_reader.doc_store_version();

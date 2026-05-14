@@ -521,6 +521,425 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// Regression for the `stack_with_remap` composition contract: the
+    /// caller's `remap` is keyed by the SOURCE SCHEMA's logical field ids
+    /// even when the source itself was produced by an earlier translating
+    /// stack. Two chained stacks must compose into a single trailer that
+    /// correctly translates source-of-source byte ids all the way through
+    /// to the final target schema.
+    ///
+    /// Setup: source-of-source schema [title] (id 0). Write docs into a
+    /// V3 store — bytes encode field id 0. Stack it into `source` with
+    /// remap {0 → 1} (source schema is [pad, title] with title at id 1).
+    /// Then stack `source` into `target` with remap {1 → 2} (target
+    /// schema is [pad0, pad1, title] with title at id 2). The composed
+    /// `target` trailer must map byte id 0 → 2.
+    #[test]
+    fn test_stack_with_remap_composition_chains_correctly() -> crate::Result<()> {
+        let directory = RamDirectory::create();
+
+        // Source-of-source: title at id 0.
+        let sos_schema = {
+            let mut sb = Schema::builder();
+            sb.add_text_field("title", TextOptions::default().set_stored());
+            sb.build()
+        };
+        let sos_title = sos_schema.get_field("title").unwrap();
+
+        let sos_path = Path::new("sos");
+        {
+            let wrt = directory.open_write(sos_path)?;
+            let mut sw = StoreWriter::new(wrt, Compressor::Lz4, BLOCK_SIZE, false)?;
+            for i in 0..15 {
+                let mut doc = TantivyDocument::default();
+                doc.add_text(sos_title, format!("chained {i}"));
+                sw.store(&doc, &sos_schema)?;
+            }
+            sw.close()?;
+        }
+
+        // First stack: source-of-source → source.
+        // Source schema is [pad, title]; title is at id 1.
+        let source_path = Path::new("source");
+        {
+            let reader_sos = StoreReader::open(directory.open_read(sos_path)?, 10)?;
+            let wrt = directory.open_write(source_path)?;
+            let mut sw = StoreWriter::new(wrt, Compressor::Lz4, BLOCK_SIZE, false)?;
+            sw.stack_with_remap(reader_sos, BlockFieldRemap::from_pairs([(0u32, 1u32)]))?;
+            sw.close()?;
+        }
+        // Sanity: the intermediate `source` carries a non-identity remap.
+        let source_reader = StoreReader::open(directory.open_read(source_path)?, 10)?;
+        assert!(source_reader.has_non_identity_remap());
+
+        // Second stack: source → target.
+        // Target schema is [pad0, pad1, title]; title is at id 2. User
+        // passes the SOURCE SCHEMA's id (1) → target schema id (2).
+        let target_path = Path::new("target");
+        {
+            let wrt = directory.open_write(target_path)?;
+            let mut sw = StoreWriter::new(wrt, Compressor::Lz4, BLOCK_SIZE, false)?;
+            sw.stack_with_remap(source_reader, BlockFieldRemap::from_pairs([(1u32, 2u32)]))?;
+            sw.close()?;
+        }
+
+        // Read target with the final target schema and confirm the title
+        // value resurfaces at id 2.
+        let target_schema = {
+            let mut sb = Schema::builder();
+            sb.add_text_field("pad0", TextOptions::default().set_stored());
+            sb.add_text_field("pad1", TextOptions::default().set_stored());
+            sb.add_text_field("title", TextOptions::default().set_stored());
+            sb.build()
+        };
+        let target_title = target_schema.get_field("title").unwrap();
+        assert_eq!(target_title.field_id(), 2);
+
+        let target_reader = StoreReader::open(directory.open_read(target_path)?, 10)?;
+        for i in 0..15u32 {
+            let doc: TantivyDocument = target_reader.get(i)?;
+            let value = doc
+                .get_first(target_title)
+                .and_then(|v| v.as_value().as_str())
+                .map(|s| s.to_string());
+            assert_eq!(
+                value.as_deref(),
+                Some(format!("chained {i}").as_str()),
+                "chained-stack composition must propagate field translation \
+                 from source-of-source through source to target",
+            );
+            // The non-title field ids must NOT be populated — composition
+            // shouldn't leak any source-of-source bytes to the wrong field.
+            let pad0 = target_schema.get_field("pad0").unwrap();
+            let pad1 = target_schema.get_field("pad1").unwrap();
+            assert!(doc.get_first(pad0).is_none());
+            assert!(doc.get_first(pad1).is_none());
+        }
+        Ok(())
+    }
+
+    /// V1 sources encode datetime values as i64 microseconds; V2/V3 use
+    /// nanoseconds. A byte-copy stack would silently rescale every datetime
+    /// by 1000x because the bytes pass through unchanged while the target
+    /// footer claims V3. Both `stack` and `stack_with_remap` must refuse a
+    /// V1 source with a clear error.
+    #[test]
+    fn test_stack_rejects_v1_sources() -> crate::Result<()> {
+        let directory = RamDirectory::create();
+        let schema = {
+            let mut sb = Schema::builder();
+            sb.add_text_field("title", TextOptions::default().set_stored());
+            sb.build()
+        };
+        let title = schema.get_field("title").unwrap();
+
+        // Write a V1 store via the test-only constructor.
+        let v1_path = Path::new("v1");
+        {
+            let wrt = directory.open_write(v1_path)?;
+            let mut sw = StoreWriter::new_with_version(
+                wrt,
+                Compressor::Lz4,
+                BLOCK_SIZE,
+                false,
+                DocStoreVersion::V1,
+            )?;
+            for i in 0..5 {
+                let mut doc = TantivyDocument::default();
+                doc.add_text(title, format!("v1 doc {i}"));
+                sw.store(&doc, &schema)?;
+            }
+            sw.close()?;
+        }
+        let v1_reader_for_stack =
+            StoreReader::open(directory.open_read(v1_path)?, 10)?;
+        let v1_reader_for_remap =
+            StoreReader::open(directory.open_read(v1_path)?, 10)?;
+
+        // `stack` must reject.
+        let stack_err = {
+            let wrt = directory.open_write(Path::new("v3_via_stack"))?;
+            let mut sw = StoreWriter::new(wrt, Compressor::Lz4, BLOCK_SIZE, false)?;
+            sw.stack(v1_reader_for_stack).unwrap_err()
+        };
+        let msg = format!("{stack_err}");
+        assert!(
+            msg.contains("V1") && msg.contains("microsecond"),
+            "stack should explain why V1 was refused; got: {msg}"
+        );
+
+        // `stack_with_remap` must reject.
+        let remap_err = {
+            let wrt = directory.open_write(Path::new("v3_via_remap"))?;
+            let mut sw = StoreWriter::new(wrt, Compressor::Lz4, BLOCK_SIZE, false)?;
+            sw.stack_with_remap(
+                v1_reader_for_remap,
+                BlockFieldRemap::from_pairs([(0u32, 0u32)]),
+            )
+            .unwrap_err()
+        };
+        let msg = format!("{remap_err}");
+        assert!(
+            msg.contains("V1") && msg.contains("microsecond"),
+            "stack_with_remap should explain why V1 was refused; got: {msg}"
+        );
+
+        Ok(())
+    }
+
+    /// `iter_doc_bytes_translated` is the slow merger path; it must honor
+    /// the `alive_bitset` so deleted docs from a non-identity-remap source
+    /// don't leak into the merged segment.
+    #[test]
+    fn test_iter_doc_bytes_translated_respects_alive_bitset() -> crate::Result<()> {
+        let directory = RamDirectory::create();
+        let source_schema = {
+            let mut sb = Schema::builder();
+            sb.add_text_field("title", TextOptions::default().set_stored());
+            sb.build()
+        };
+        let target_schema = {
+            let mut sb = Schema::builder();
+            sb.add_text_field("pad", TextOptions::default().set_stored());
+            sb.add_text_field("title", TextOptions::default().set_stored());
+            sb.build()
+        };
+        let src_title = source_schema.get_field("title").unwrap();
+
+        let src_path = Path::new("source");
+        {
+            let wrt = directory.open_write(src_path)?;
+            let mut sw = StoreWriter::new(wrt, Compressor::Lz4, BLOCK_SIZE, false)?;
+            for i in 0..10 {
+                let mut doc = TantivyDocument::default();
+                doc.add_text(src_title, format!("doc {i}"));
+                sw.store(&doc, &source_schema)?;
+            }
+            sw.close()?;
+        }
+
+        let stacked_path = Path::new("stacked");
+        {
+            let reader = StoreReader::open(directory.open_read(src_path)?, 10)?;
+            let wrt = directory.open_write(stacked_path)?;
+            let mut sw = StoreWriter::new(wrt, Compressor::Lz4, BLOCK_SIZE, false)?;
+            sw.stack_with_remap(reader, BlockFieldRemap::from_pairs([(0u32, 1u32)]))?;
+            sw.close()?;
+        }
+
+        let stacked_reader = StoreReader::open(directory.open_read(stacked_path)?, 10)?;
+
+        // Mark only the even doc ids as alive.
+        let mut bitset = AliveBitSet::for_test_from_deleted_docs(
+            &[1, 3, 5, 7, 9],
+            10,
+        );
+        // Ensure we exercise the alive_bitset path.
+        assert_eq!(bitset.num_alive_docs(), 5);
+
+        let translated: Vec<Vec<u8>> = stacked_reader
+            .iter_doc_bytes_translated(&target_schema, Some(&mut bitset))
+            .collect::<crate::Result<Vec<_>>>()?;
+        assert_eq!(translated.len(), 5, "only 5 alive docs should be yielded");
+
+        // Round-trip each translated payload through a fresh empty-remap
+        // block and decode under the target schema. The recovered titles
+        // must be exactly the even-indexed docs in order.
+        let merged_path = Path::new("merged");
+        {
+            let wrt = directory.open_write(merged_path)?;
+            let mut sw = StoreWriter::new(wrt, Compressor::Lz4, BLOCK_SIZE, false)?;
+            for bytes in &translated {
+                sw.store_bytes(bytes)?;
+            }
+            sw.close()?;
+        }
+        let merged_reader =
+            StoreReader::open(directory.open_read(merged_path)?, 10)?;
+        let tgt_title = target_schema.get_field("title").unwrap();
+        for (slot, expected_i) in (0u32..5).zip([0u32, 2, 4, 6, 8]) {
+            let doc: TantivyDocument = merged_reader.get(slot)?;
+            assert_eq!(
+                doc.get_first(tgt_title).and_then(|v| v.as_value().as_str()),
+                Some(format!("doc {expected_i}").as_str()),
+            );
+        }
+        Ok(())
+    }
+
+    /// `iter_doc_bytes_translated` must surface a `SchemaError` rather
+    /// than panic when the source segment's remap targets a field id
+    /// outside the target schema's range. The serializer's
+    /// `Schema::get_field_entry` is an unchecked Vec index — a stale or
+    /// malicious trailer would otherwise crash the merge thread.
+    #[test]
+    fn test_iter_doc_bytes_translated_out_of_range_target_yields_error()
+    -> crate::Result<()> {
+        let directory = RamDirectory::create();
+        let source_schema = {
+            let mut sb = Schema::builder();
+            sb.add_text_field("title", TextOptions::default().set_stored());
+            sb.build()
+        };
+        let src_title = source_schema.get_field("title").unwrap();
+
+        // Source store: one doc with title at id 0.
+        let src_path = Path::new("src");
+        {
+            let wrt = directory.open_write(src_path)?;
+            let mut sw = StoreWriter::new(wrt, Compressor::Lz4, BLOCK_SIZE, false)?;
+            for i in 0..5 {
+                let mut doc = TantivyDocument::default();
+                doc.add_text(src_title, format!("bounds doc {i}"));
+                sw.store(&doc, &source_schema)?;
+            }
+            sw.close()?;
+        }
+
+        // Stack with a remap that targets a field id WAY past anything
+        // any plausible target schema would have. The stack succeeds (the
+        // writer never sees the target schema), but the merger-style read
+        // path must reject when fed a 2-field target schema.
+        let stacked_path = Path::new("stacked");
+        {
+            let reader = StoreReader::open(directory.open_read(src_path)?, 10)?;
+            let wrt = directory.open_write(stacked_path)?;
+            let mut sw = StoreWriter::new(wrt, Compressor::Lz4, BLOCK_SIZE, false)?;
+            // Map source field 0 → 99 (out of range for the 2-field
+            // target schema below).
+            sw.stack_with_remap(reader, BlockFieldRemap::from_pairs([(0u32, 99u32)]))?;
+            sw.close()?;
+        }
+        let stacked_reader =
+            StoreReader::open(directory.open_read(stacked_path)?, 10)?;
+
+        let target_schema = {
+            let mut sb = Schema::builder();
+            sb.add_text_field("a", TextOptions::default().set_stored());
+            sb.add_text_field("b", TextOptions::default().set_stored());
+            sb.build()
+        };
+
+        let mut iter = stacked_reader.iter_doc_bytes_translated(&target_schema, None);
+        let first = iter.next().expect("at least one doc");
+        let err = first.unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("outside") && msg.contains("range"),
+            "expected bounds-check SchemaError, got: {msg}"
+        );
+        Ok(())
+    }
+
+    /// `stack_with_remap` writes a per-block V3 trailer, so the target
+    /// `output_version` must be V3+. Calling it on a V2-output writer
+    /// (test-only path) is a contract violation and must fail loudly
+    /// rather than emit a V2 file with stray V3 trailers.
+    #[test]
+    fn test_stack_with_remap_rejects_v2_output() -> crate::Result<()> {
+        let directory = RamDirectory::create();
+        let source_schema = {
+            let mut sb = Schema::builder();
+            sb.add_text_field("title", TextOptions::default().set_stored());
+            sb.build()
+        };
+        let src_title = source_schema.get_field("title").unwrap();
+
+        let src_path = Path::new("src");
+        {
+            let wrt = directory.open_write(src_path)?;
+            let mut sw = StoreWriter::new(wrt, Compressor::Lz4, BLOCK_SIZE, false)?;
+            for i in 0..3 {
+                let mut doc = TantivyDocument::default();
+                doc.add_text(src_title, format!("v2 out doc {i}"));
+                sw.store(&doc, &source_schema)?;
+            }
+            sw.close()?;
+        }
+        let reader = StoreReader::open(directory.open_read(src_path)?, 10)?;
+
+        // V2-output writer + stack_with_remap = must reject.
+        let wrt = directory.open_write(Path::new("v2_target"))?;
+        let mut sw = StoreWriter::new_with_version(
+            wrt,
+            Compressor::Lz4,
+            BLOCK_SIZE,
+            false,
+            DocStoreVersion::V2,
+        )?;
+        let err = sw
+            .stack_with_remap(reader, BlockFieldRemap::from_pairs([(0u32, 1u32)]))
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("V3") && msg.contains("target"),
+            "expected V3-target rejection, got: {msg}"
+        );
+        Ok(())
+    }
+
+    /// V3 source → V2 target via `stack`: the per-block walk must strip
+    /// each block's V3 trailer before writing, so the resulting V2 store
+    /// has no trailer bytes (a V2 reader would otherwise treat the
+    /// trailing length as compressed-payload garbage).
+    #[test]
+    fn test_stack_v3_source_into_v2_target_strips_trailer() -> crate::Result<()> {
+        const NUM_DOCS: usize = 30;
+        let directory = RamDirectory::create();
+        let schema = {
+            let mut sb = Schema::builder();
+            sb.add_text_field("title", TextOptions::default().set_stored());
+            sb.build()
+        };
+        let title = schema.get_field("title").unwrap();
+
+        // 1. Source: V3 store with empty trailers (the default).
+        let v3_path = Path::new("v3");
+        {
+            let wrt = directory.open_write(v3_path)?;
+            let mut sw = StoreWriter::new(wrt, Compressor::Lz4, BLOCK_SIZE, false)?;
+            for i in 0..NUM_DOCS {
+                let mut doc = TantivyDocument::default();
+                doc.add_text(title, format!("strip doc {i}"));
+                sw.store(&doc, &schema)?;
+            }
+            sw.close()?;
+        }
+        let v3_reader =
+            StoreReader::open(directory.open_read(v3_path)?, 10)?;
+        assert_eq!(v3_reader.doc_store_version(), DocStoreVersion::V3);
+
+        // 2. Target: V2 writer that stacks the V3 source. The per-block
+        // path must strip each trailer; otherwise V3 trailer bytes leak
+        // into the V2 file and break decompression.
+        let v2_path = Path::new("v2");
+        {
+            let wrt = directory.open_write(v2_path)?;
+            let mut sw = StoreWriter::new_with_version(
+                wrt,
+                Compressor::Lz4,
+                BLOCK_SIZE,
+                false,
+                DocStoreVersion::V2,
+            )?;
+            sw.stack(v3_reader)?;
+            sw.close()?;
+        }
+
+        // 3. Reopen as V2; all docs must still decode cleanly.
+        let v2_reader =
+            StoreReader::open(directory.open_read(v2_path)?, 10)?;
+        assert_eq!(v2_reader.doc_store_version(), DocStoreVersion::V2);
+        for i in 0..NUM_DOCS as u32 {
+            let doc: TantivyDocument = v2_reader.get(i)?;
+            assert_eq!(
+                doc.get_first(title).and_then(|v| v.as_value().as_str()),
+                Some(format!("strip doc {i}").as_str()),
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn test_merge_of_small_segments() -> crate::Result<()> {
         let mut schema_builder = schema::Schema::builder();

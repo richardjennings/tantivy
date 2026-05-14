@@ -105,6 +105,16 @@ fn merge(
         return Ok(None);
     }
 
+    // `SegmentUpdater` holds an `Index` clone whose schema field is frozen
+    // at writer-creation time. If `IndexWriter::extend_schema` has run
+    // since, that frozen schema is missing the new fields. The merged
+    // segment created from this Index would inherit the stale schema and
+    // any merger codepath that touches the new field id would panic.
+    // Clone the Index here and overwrite its schema with the schema the
+    // caller passed (the writer's current `Index::schema()`).
+    let mut index = index.clone();
+    index.set_schema_in_memory(schema.clone());
+
     // first we need to apply deletes to our segment.
     let merged_segment = index.new_segment();
 

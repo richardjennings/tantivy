@@ -699,14 +699,22 @@ impl<D: Document> IndexWriter<D> {
         //    about to be added.
         self.commit()?;
 
-        // 2. Persist the extended schema. The writer already holds
+        // 2. Drain any merges `commit()`'s `consider_merge_options` may
+        //    have scheduled. Their `end_merge` calls `save_metas`, which
+        //    reads `current_schema` — if a merge finishes between steps
+        //    3 and 4 below, its save_metas writes the OLD schema back to
+        //    `meta.json` and silently reverts the extension. Waiting here
+        //    closes that window without taking a separate lock.
+        self.segment_updater.wait_merging_thread()?;
+
+        // 3. Persist the extended schema. The writer already holds
         //    INDEX_WRITER_LOCK so we use the no-lock variant —
         //    `Index::extend_schema` would deadlock trying to reacquire it.
         //    Validation (strict prefix extension) and the atomic meta.json
         //    rewrite still happen here.
         self.index.extend_schema_no_lock(new_schema)?;
 
-        // 3. Propagate the schema to the segment updater. SegmentUpdater
+        // 4. Propagate the schema to the segment updater. SegmentUpdater
         //    holds its own `Index` clone with a frozen schema field; without
         //    this set_schema call, the next commit or end-merge would write
         //    the OLD schema back into `meta.json` and silently revert the

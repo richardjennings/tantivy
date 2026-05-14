@@ -660,6 +660,16 @@ impl Index {
     ///
     /// Returns an error and leaves the on-disk state untouched if
     /// `new_schema` is not a valid prefix extension.
+    /// Internal: overwrite this `Index` clone's schema without touching
+    /// disk. Used by `IndexWriter::extend_schema` to propagate a freshly
+    /// validated schema to the `SegmentUpdater`'s own `Index` clone so its
+    /// subsequent `new_segment` calls (in the merge thread) see the new
+    /// fields. `extend_schema` itself does the validation + meta.json
+    /// rewrite; this is just the in-memory swap.
+    pub(crate) fn set_schema_in_memory(&mut self, new_schema: Schema) {
+        self.schema = new_schema;
+    }
+
     pub fn extend_schema(&mut self, new_schema: Schema) -> crate::Result<()> {
         // Acquire the same exclusive lock that `IndexWriter` creation takes,
         // so a concurrent commit or end-merge in another process can't
@@ -1087,5 +1097,94 @@ mod extend_schema_tests {
             msg.contains("modified") || msg.contains("changed") || msg.contains("options"),
             "expected option-change rejection error, got: {msg}"
         );
+    }
+
+    /// Extends the schema mid-batch, commits, adds more docs, commits a
+    /// SECOND time, then runs a merge across both segments. After all of
+    /// this the meta.json must still reflect the extended schema and the
+    /// merged segment must still be queryable on the new field. Verifies
+    /// that `SegmentUpdater::set_schema` propagates through both commits
+    /// AND through `end_merge` (which also runs `save_metas`).
+    #[test]
+    fn index_writer_extend_schema_survives_merge() -> crate::Result<()> {
+        use crate::directory::RamDirectory;
+
+        let directory = RamDirectory::create();
+        let index = Index::create(directory.clone(), build_schema_v1(), Default::default())?;
+        let title_v1 = index.schema().get_field("title")?;
+        let price_v1 = index.schema().get_field("price")?;
+
+        let mut writer: crate::IndexWriter = index.writer_for_tests()?;
+        // First batch under the v1 schema.
+        for i in 0..20 {
+            writer.add_document(doc!(
+                title_v1 => format!("old {i}").as_str(),
+                price_v1 => (i as f64) * 1.5,
+            ))?;
+        }
+        let new_schema = writer.extend_schema(build_schema_v2_add_color())?;
+        let new_title = new_schema.get_field("title")?;
+        let new_price = new_schema.get_field("price")?;
+        let color = new_schema.get_field("color")?;
+        // Second batch under the extended schema — commits a separate
+        // segment so the merge step has something to merge against.
+        for i in 0..15 {
+            writer.add_document(doc!(
+                new_title => format!("new {i}").as_str(),
+                new_price => (i as f64) * 0.25,
+                color => if i % 3 == 0 { "red" } else { "blue" },
+            ))?;
+        }
+        writer.commit()?;
+
+        // Add a third batch and commit once more so we have multiple
+        // segments to merge.
+        for i in 0..15 {
+            writer.add_document(doc!(
+                new_title => format!("third {i}").as_str(),
+                new_price => (i as f64) * 0.5,
+                color => "green",
+            ))?;
+        }
+        writer.commit()?;
+
+        // Run a merge over every committed segment.
+        let segment_ids = writer.index().searchable_segment_ids()?;
+        assert!(segment_ids.len() >= 2, "expected at least 2 segments to merge");
+        writer.merge(&segment_ids).wait()?;
+        writer.wait_merging_threads()?;
+
+        // Reopen from disk — meta.json is the only source of truth now.
+        let reopened = Index::open(directory)?;
+        let on_disk_schema = reopened.schema();
+        assert!(
+            on_disk_schema.get_field("color").is_ok(),
+            "the extended `color` field must persist through commit + merge"
+        );
+        assert_eq!(on_disk_schema.fields().count(), 3);
+
+        let reader = reopened.reader()?;
+        let searcher = reader.searcher();
+        // Sanity: all 50 docs survived merge.
+        assert_eq!(searcher.num_docs(), 50);
+
+        // The new field is still queryable after the merge.
+        let color = on_disk_schema.get_field("color")?;
+        for (color_value, expected_count) in
+            [("green", 15usize), ("blue", 10), ("red", 5)]
+        {
+            let q = crate::query::TermQuery::new(
+                crate::Term::from_field_text(color, color_value),
+                crate::schema::IndexRecordOption::Basic,
+            );
+            use crate::collector::TopDocs;
+            let top = searcher.search(&q, &TopDocs::with_limit(100).order_by_score())?;
+            assert_eq!(
+                top.len(),
+                expected_count,
+                "color={color_value} should match {expected_count} docs after merge"
+            );
+        }
+        Ok(())
     }
 }

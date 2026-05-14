@@ -201,10 +201,24 @@ impl IndexMerger {
         let mut fieldnorms_data = Vec::with_capacity(self.max_doc as usize);
         for field in fields {
             fieldnorms_data.clear();
+            // Segments written before `IndexWriter::extend_schema` added
+            // `field` won't have a fieldnorm column for it. Treat the
+            // missing column as a constant fieldnorm of 0 — equivalent to
+            // "this doc never set a value for this field", which is the
+            // existing semantics for sparse fields within a segment.
             let fieldnorms_readers: Vec<FieldNormReader> = self
                 .readers
                 .iter()
-                .map(|reader| reader.get_fieldnorms_reader(field))
+                .map(|reader| {
+                    Ok::<_, crate::TantivyError>(
+                        reader
+                            .fieldnorms_readers()
+                            .get_field(field)?
+                            .unwrap_or_else(|| {
+                                FieldNormReader::constant(reader.max_doc(), 0)
+                            }),
+                    )
+                })
                 .collect::<Result<_, _>>()?;
             for old_doc_addr in doc_id_mapping.iter_old_doc_addrs() {
                 let fieldnorms_reader = &fieldnorms_readers[old_doc_addr.segment_ord as usize];

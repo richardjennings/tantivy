@@ -319,6 +319,18 @@ impl StoreReader {
     /// decompressing a compressed block. The store utilizes a LRU cache,
     /// so accessing docs from the same compressed block should be faster.
     /// For that reason a store reader should be kept and reused.
+    ///
+    /// **WARNING — V3 with non-identity remap:** the returned bytes encode
+    /// the *source schema's* field ids (whatever the V3 trailer was
+    /// translating away from). Decoding them with
+    /// `BinaryDocumentDeserializer::from_reader` (no remap) under the
+    /// surrounding index's schema will produce a document with the wrong
+    /// field ids. If the store has any non-identity remap blocks
+    /// ([`has_non_identity_remap`](Self::has_non_identity_remap) returns
+    /// true), prefer [`get`](Self::get) — it pairs the bytes with the
+    /// trailer automatically. This raw-bytes API is intended for callers
+    /// that only stream bytes through to another consumer (e.g. peer
+    /// replication of fresh V3 blocks where the remap is empty).
     pub fn get_document_bytes(&self, doc_id: DocId) -> crate::Result<OwnedBytes> {
         let checkpoint = self.block_checkpoint(doc_id)?;
         let block = self.read_block(&checkpoint)?;
@@ -494,10 +506,25 @@ impl StoreReader {
         alive_bitset: Option<&'a AliveBitSet>,
     ) -> impl Iterator<Item = crate::Result<Vec<u8>>> + 'b {
         let version = self.doc_store_version;
+        let target_field_count = target_schema.fields().count() as u32;
         self.iter_raw_with_remap(alive_bitset).map(move |res| {
             let (mut doc_bytes, remap) = res?;
             if remap.is_empty() {
                 return Ok(doc_bytes.as_slice().to_vec());
+            }
+            // Validate the remap doesn't translate any encoded id to a
+            // target id that's out of range for `target_schema`. Without
+            // this guard, `BinaryDocumentSerializer::serialize_doc` would
+            // call `Schema::get_field_entry` (an unchecked Vec index) and
+            // panic, taking down the merge thread mid-run.
+            for (encoded, target) in remap.pairs() {
+                if target >= target_field_count {
+                    return Err(crate::TantivyError::SchemaError(format!(
+                        "iter_doc_bytes_translated: remap entry {encoded} \
+                         → {target} targets a field id outside the target \
+                         schema's {target_field_count}-field range"
+                    )));
+                }
             }
             let deserializer = BinaryDocumentDeserializer::from_reader_with_remap(
                 &mut doc_bytes,
@@ -508,6 +535,22 @@ impl StoreReader {
             let doc: crate::TantivyDocument =
                 crate::TantivyDocument::deserialize(deserializer)
                     .map_err(crate::TantivyError::from)?;
+            // Catch field ids that bypassed the remap (encoded id ≥
+            // target schema's field count and absent from remap, so
+            // lookup falls through to identity) before they reach the
+            // serializer. CompactDoc.field_values yields the same
+            // (Field, value) pairs the serializer would iterate.
+            for (field, _) in doc.field_values() {
+                if field.field_id() >= target_field_count {
+                    return Err(crate::TantivyError::SchemaError(format!(
+                        "iter_doc_bytes_translated: decoded field id {} \
+                         (after remap) is outside the target schema's \
+                         {target_field_count}-field range — caller must \
+                         supply a remap entry for it",
+                        field.field_id()
+                    )));
+                }
+            }
             let mut out: Vec<u8> = Vec::with_capacity(doc_bytes.len());
             let mut serializer = BinaryDocumentSerializer::new(&mut out, target_schema);
             serializer.serialize_doc(&doc)?;
@@ -517,22 +560,33 @@ impl StoreReader {
 
     /// True if any block in this store has a non-identity remap trailer.
     /// Cheap pre-check for the merger's slow path: V1/V2 stores trivially
-    /// return false, V3 stores scan block trailers (last 4 bytes per block).
+    /// return false; V3 stores read only the last 4 bytes of each block
+    /// (the `u32 trailer_byte_len`) — full block fetches are avoided so
+    /// the precheck is O(N_blocks * 4 bytes) over the doc store rather
+    /// than O(total compressed bytes). Critical for remote/network
+    /// directories (Quickwit-style FS) where every fetch is an HTTP call.
     pub(crate) fn has_non_identity_remap(&self) -> bool {
         if self.doc_store_version < DocStoreVersion::V3 {
             return false;
         }
         for checkpoint in self.block_checkpoints() {
-            let Ok(block_bytes) = self.get_compressed_block(&checkpoint) else {
-                // I/O error here will surface again in the actual read; treat
-                // as "might have remap" so the caller takes the safe slow path.
+            let block_len = checkpoint.byte_range.end - checkpoint.byte_range.start;
+            if block_len < 4 {
+                // Corrupt block (no room for the trailer length itself).
+                // Treat as "might have remap" so the safe slow path runs.
+                return true;
+            }
+            let trailer_len_start = checkpoint.byte_range.end - 4;
+            let trailer_len_range = trailer_len_start..checkpoint.byte_range.end;
+            let Ok(tail) = self.data.slice(trailer_len_range).read_bytes() else {
                 return true;
             };
-            let Ok((_, trailer_byte_len)) =
-                super::block_trailer::read_block_trailer(block_bytes.as_ref())
-            else {
-                return true;
-            };
+            let trailer_byte_len = u32::from_le_bytes([
+                tail.as_slice()[0],
+                tail.as_slice()[1],
+                tail.as_slice()[2],
+                tail.as_slice()[3],
+            ]) as usize;
             // 4 == empty trailer (just the u32 length itself).
             if trailer_byte_len > 4 {
                 return true;
@@ -627,9 +681,12 @@ impl StoreReader {
 
     /// Reads raw bytes of a given document asynchronously.
     ///
-    /// Note: for V3 blocks with a non-identity remap, these bytes encode the
-    /// SOURCE schema's field ids and require trailer-aware decoding. Prefer
-    /// [`get_async`](Self::get_async) for typed documents.
+    /// **WARNING — V3 with non-identity remap:** the returned bytes encode
+    /// the *source schema's* field ids; decoding them with
+    /// `BinaryDocumentDeserializer::from_reader` will produce a document
+    /// with wrong field ids. Prefer [`get_async`](Self::get_async) when
+    /// the store may carry a translating trailer
+    /// ([`has_non_identity_remap`](Self::has_non_identity_remap)).
     pub async fn get_document_bytes_async(
         &self,
         doc_id: DocId,
