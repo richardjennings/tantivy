@@ -3,7 +3,7 @@
 This branch (`virtualize-store-field-ids-on-main`) adds **cross-schema doc
 store stacking** and **additive schema evolution** on top of upstream
 `quickwit-oss/tantivy` main. The merge base is the `vendor tantivy main`
-commit; everything below sits as 6 commits on top of it.
+commit; everything below sits as 7 commits on top of it.
 
 ## TL;DR
 
@@ -345,6 +345,7 @@ allocation before the loop discovers the read past EOF.
 ## Commits
 
 ```
+1215293 Round-3 polish + change log doc
 0646171 Second round of fixes from independent review
 383ffc6 Fixes from independent review
 03859cb Add IndexWriter::extend_schema for mid-batch schema extension
@@ -353,17 +354,19 @@ ddf40c6 Add Index::extend_schema for additive schema evolution
 2ce1928 Add DocStoreVersion::V3 with per-block field-id remap trailer
 ```
 
-The two "fixes from independent review" commits fold in changes from
-seven separate code reviews (four reviewers in each round). Topics
-addressed: merger handling of remapped segments, schema propagation to
-the segment updater, the quickwit async path, LRU cache behavior, V3
-trailer determinism, V1 rejection, the writer lock around
-`extend_schema`, the bounds check in `iter_doc_bytes_translated`, the
-commit/extend_schema race, the field-norms gap in `extend_schema +
-merge`, the `output_version` dispatch in `stack`, the `has_non_identity_remap`
-perf, raw-bytes API hazards, the trailer-length cast, and the
-`is_stored` validation. Before squashing for an upstream PR these can
-be folded into the four feature commits.
+The three "review-fixes / polish" commits fold in changes from seven
+separate code reviews (four reviewers in each of the first two rounds,
+plus targeted follow-ups). Topics addressed: merger handling of
+remapped segments, schema propagation to the segment updater, the
+quickwit async path, LRU cache behavior, V3 trailer determinism, V1
+rejection, the writer lock around `extend_schema`, the bounds check in
+`iter_doc_bytes_translated`, the commit/extend_schema race, the
+field-norms gap in `extend_schema + merge`, the `output_version`
+dispatch in `stack`, the `has_non_identity_remap` perf, raw-bytes API
+hazards, the trailer-length cast, the `is_stored` validation, the
+`deserialize_body` allocation bound, the `sync_directory` ordering, and
+the identity-but-non-empty fast path. Before squashing for an upstream
+PR these can be folded into the four feature commits.
 
 ## Test coverage
 
