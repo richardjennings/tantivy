@@ -37,7 +37,28 @@ impl StoreWriter {
         block_size: usize,
         dedicated_thread: bool,
     ) -> io::Result<StoreWriter> {
-        let block_compressor = BlockCompressor::new(compressor, writer, dedicated_thread)?;
+        Self::new_with_version(
+            writer,
+            compressor,
+            block_size,
+            dedicated_thread,
+            crate::store::DOC_STORE_VERSION,
+        )
+    }
+
+    /// Same as [`Self::new`] but with an explicit on-disk format version.
+    /// Used in tests to construct legacy V2 fixtures that exercise the
+    /// V2→V3 cross-version stack path; production callers should stick
+    /// with [`Self::new`].
+    pub(crate) fn new_with_version(
+        writer: WritePtr,
+        compressor: Compressor,
+        block_size: usize,
+        dedicated_thread: bool,
+        output_version: crate::store::DocStoreVersion,
+    ) -> io::Result<StoreWriter> {
+        let block_compressor =
+            BlockCompressor::new_with_version(compressor, writer, dedicated_thread, output_version)?;
         Ok(StoreWriter {
             compressor,
             block_size,

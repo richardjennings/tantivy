@@ -25,7 +25,21 @@ enum BlockCompressorVariants {
 
 impl BlockCompressor {
     pub fn new(compressor: Compressor, wrt: WritePtr, dedicated_thread: bool) -> io::Result<Self> {
-        let block_compressor_impl = BlockCompressorImpl::new(compressor, wrt);
+        Self::new_with_version(compressor, wrt, dedicated_thread, DOC_STORE_VERSION)
+    }
+
+    /// Test/internal: build a `BlockCompressor` that emits a specific
+    /// on-disk format version. Production callers should use [`Self::new`],
+    /// which defaults to `DOC_STORE_VERSION`. Used by the V2→V3 cross-
+    /// version stack tests to mint legacy-format fixtures.
+    pub(crate) fn new_with_version(
+        compressor: Compressor,
+        wrt: WritePtr,
+        dedicated_thread: bool,
+        output_version: DocStoreVersion,
+    ) -> io::Result<Self> {
+        let block_compressor_impl =
+            BlockCompressorImpl::new_with_version(compressor, wrt, output_version);
         if dedicated_thread {
             let dedicated_thread_compressor =
                 DedicatedThreadBlockCompressorImpl::new(block_compressor_impl)?;
@@ -107,16 +121,30 @@ struct BlockCompressorImpl {
     offset_index_writer: SkipIndexBuilder,
     intermediary_buffer: Vec<u8>,
     writer: CountingWriter<WritePtr>,
+    /// On-disk format version this compressor will emit. Production code
+    /// always sets this to `DOC_STORE_VERSION` (V3). Tests can override it
+    /// to V2 to construct legacy-format fixtures that exercise the V2→V3
+    /// cross-version stack path.
+    output_version: DocStoreVersion,
 }
 
 impl BlockCompressorImpl {
     fn new(compressor: Compressor, writer: WritePtr) -> Self {
+        Self::new_with_version(compressor, writer, DOC_STORE_VERSION)
+    }
+
+    fn new_with_version(
+        compressor: Compressor,
+        writer: WritePtr,
+        output_version: DocStoreVersion,
+    ) -> Self {
         Self {
             compressor,
             first_doc_in_block: 0,
             offset_index_writer: SkipIndexBuilder::new(),
             intermediary_buffer: Vec::new(),
             writer: CountingWriter::wrap(writer),
+            output_version,
         }
     }
 
@@ -133,7 +161,7 @@ impl BlockCompressorImpl {
         // the trailer occupies exactly 4 bytes (`u32 trailer_byte_len = 4`).
         // Older V2 blocks (e.g. read by an upgraded reader) have no trailer
         // — version dispatch handles that on the read side.
-        if DOC_STORE_VERSION >= DocStoreVersion::V3 {
+        if self.output_version >= DocStoreVersion::V3 {
             write_block_trailer(&mut self.writer, &BlockFieldRemap::default())?;
         }
         let end_offset = self.writer.written_bytes() as usize;
@@ -154,22 +182,47 @@ impl BlockCompressorImpl {
     /// This method is an optimization compared to iterating over the documents
     /// in the store and adding them one by one, as the store's data will
     /// not be decompressed and then recompressed.
+    ///
+    /// Handles version mismatch: when stacking a V1/V2 source into a V3
+    /// target (or any target ≥ V3 — DOC_STORE_VERSION is V3 today), each
+    /// source block is walked individually so an empty V3 trailer can be
+    /// injected after its compressed payload. The compressed bytes
+    /// themselves are still byte-copied — no decompression. This is what
+    /// makes pre-V3 indexes safe to merge through a V3-default writer.
     fn stack(&mut self, store_reader: StoreReader) -> io::Result<()> {
+        if store_reader.doc_store_version() >= DocStoreVersion::V3 {
+            // V3 source: blocks already carry trailers — bulk byte-copy.
+            let doc_shift = self.first_doc_in_block;
+            let start_shift = self.writer.written_bytes() as usize;
+            self.writer
+                .write_all(store_reader.block_data()?.as_slice())?;
+            for mut checkpoint in store_reader.block_checkpoints() {
+                checkpoint.doc_range.start += doc_shift;
+                checkpoint.doc_range.end += doc_shift;
+                checkpoint.byte_range.start += start_shift;
+                checkpoint.byte_range.end += start_shift;
+                self.register_checkpoint(checkpoint);
+            }
+            return Ok(());
+        }
+
+        // V1/V2 source: per-block stack so we can append an empty V3 trailer
+        // after each compressed payload. The compressed bytes pass through
+        // unchanged; only the (4-byte) trailer is injected.
         let doc_shift = self.first_doc_in_block;
-        let start_shift = self.writer.written_bytes() as usize;
-
-        // just bulk write all of the block of the given reader.
-        self.writer
-            .write_all(store_reader.block_data()?.as_slice())?;
-
-        // concatenate the index of the `store_reader`, after translating
-        // its start doc id and its start file offset.
-        for mut checkpoint in store_reader.block_checkpoints() {
-            checkpoint.doc_range.start += doc_shift;
-            checkpoint.doc_range.end += doc_shift;
-            checkpoint.byte_range.start += start_shift;
-            checkpoint.byte_range.end += start_shift;
-            self.register_checkpoint(checkpoint);
+        let source_block_data = store_reader.block_data()?;
+        let source_checkpoints: Vec<Checkpoint> = store_reader.block_checkpoints().collect();
+        for checkpoint in source_checkpoints {
+            let compressed_payload = source_block_data.slice(checkpoint.byte_range.clone());
+            let start_offset = self.writer.written_bytes() as usize;
+            self.writer.write_all(compressed_payload.as_slice())?;
+            write_block_trailer(&mut self.writer, &BlockFieldRemap::default())?;
+            let end_offset = self.writer.written_bytes() as usize;
+            self.register_checkpoint(Checkpoint {
+                doc_range: (checkpoint.doc_range.start + doc_shift)
+                    ..(checkpoint.doc_range.end + doc_shift),
+                byte_range: start_offset..end_offset,
+            });
         }
         Ok(())
     }
@@ -256,7 +309,7 @@ impl BlockCompressorImpl {
         let docstore_footer = DocStoreFooter::new(
             header_offset,
             Decompressor::from(self.compressor),
-            DOC_STORE_VERSION,
+            self.output_version,
         );
         self.offset_index_writer.serialize_into(&mut self.writer)?;
         docstore_footer.serialize(&mut self.writer)?;

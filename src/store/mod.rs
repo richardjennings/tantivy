@@ -330,6 +330,86 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// V2→V3 cross-version stack: write a legacy V2 store, then stack it
+    /// into a V3 target via the public StoreWriter::stack path. The V3
+    /// reader must see the same docs back. Regression guard for the
+    /// "rebuild legacy indexes before mixing with new ones" footgun.
+    #[test]
+    fn test_stack_v2_source_into_v3_target() -> crate::Result<()> {
+        const NUM_LEGACY: usize = 250;
+        let directory = RamDirectory::create();
+        let legacy_path = Path::new("legacy_v2");
+        let v3_path = Path::new("v3");
+
+        // 1. Write a legacy V2 store via the test-only constructor.
+        let schema = {
+            let mut sb = Schema::builder();
+            sb.add_text_field("title", TextOptions::default().set_stored());
+            sb.build()
+        };
+        let field_title = schema.get_field("title").unwrap();
+        {
+            let wrt = directory.open_write(legacy_path)?;
+            let mut store_writer = StoreWriter::new_with_version(
+                wrt,
+                Compressor::Lz4,
+                BLOCK_SIZE,
+                false,
+                DocStoreVersion::V2,
+            )?;
+            for i in 0..NUM_LEGACY {
+                let mut doc = TantivyDocument::default();
+                doc.add_text(field_title, format!("legacy doc {i}"));
+                store_writer.store(&doc, &schema)?;
+            }
+            store_writer.close()?;
+        }
+        // Confirm the legacy store really is V2 on disk.
+        let legacy_file = directory.open_read(legacy_path)?;
+        let legacy_reader = StoreReader::open(legacy_file, 10)?;
+        assert_eq!(legacy_reader.doc_store_version(), DocStoreVersion::V2);
+
+        // 2. Stack the V2 store into a V3 target (default version).
+        {
+            let wrt = directory.open_write(v3_path)?;
+            let mut target_writer =
+                StoreWriter::new(wrt, Compressor::Lz4, BLOCK_SIZE, false)?;
+            target_writer.stack(legacy_reader)?;
+            target_writer.close()?;
+        }
+
+        // 3. Reopen as V3; reader must see V3 and return identical docs.
+        let v3_file = directory.open_read(v3_path)?;
+        let v3_reader = StoreReader::open(v3_file, 10)?;
+        assert_eq!(v3_reader.doc_store_version(), DocStoreVersion::V3);
+        for i in 0..NUM_LEGACY as u32 {
+            let doc = v3_reader.get::<TantivyDocument>(i)?;
+            let title = doc
+                .get_first(field_title)
+                .and_then(|v| v.as_value().as_str())
+                .map(|s| s.to_string());
+            assert_eq!(title.as_deref(), Some(format!("legacy doc {i}").as_str()));
+        }
+        // Sequential iter should also work end-to-end.
+        let titles: Vec<String> = v3_reader
+            .iter::<TantivyDocument>(None)
+            .map(|d| {
+                d.unwrap()
+                    .get_first(field_title)
+                    .unwrap()
+                    .as_value()
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(titles.len(), NUM_LEGACY);
+        for (i, title) in titles.iter().enumerate() {
+            assert_eq!(title, &format!("legacy doc {i}"));
+        }
+        Ok(())
+    }
+
     #[test]
     fn test_merge_of_small_segments() -> crate::Result<()> {
         let mut schema_builder = schema::Schema::builder();
