@@ -665,6 +665,63 @@ impl<D: Document> IndexWriter<D> {
         self.prepare_commit()?.commit()
     }
 
+    /// Extend the underlying index's schema with new fields appended at
+    /// the end, without dropping the writer.
+    ///
+    /// The new schema MUST be a strict prefix extension of the current one
+    /// (see [`Index::extend_schema`]). Calling this method:
+    ///
+    /// 1. Commits all pending docs against the old schema. They land in
+    ///    segments that are simply *sparse* on the new fields — exactly
+    ///    the semantics tantivy already uses for any doc that didn't set
+    ///    a value for a particular field.
+    /// 2. Rewrites `meta.json` atomically with the extended schema.
+    /// 3. Replaces this writer's indexing worker pool so subsequent
+    ///    `add_document` calls construct fresh `SegmentWriter`s against
+    ///    the extended schema. New writes can immediately reference the
+    ///    newly-added fields.
+    ///
+    /// Cost is essentially "one commit plus a worker-pool reset": no full
+    /// rebuild of the index, no merge of existing segments. The only side
+    /// effect on segment shape is that the segment(s) flushed at the
+    /// extension point are usually slightly smaller than they would have
+    /// been otherwise — they roll over earlier than the natural memory
+    /// budget would have caused.
+    ///
+    /// Returns the extended schema (already persisted) for the caller's
+    /// convenience — `Index` and `IndexWriter` carry independent schema
+    /// clones, so the caller can't see the new fields through their
+    /// outer `Index` handle without re-opening. Use the returned schema
+    /// (or `IndexWriter::index().schema()`) to look up new field IDs.
+    pub fn extend_schema(&mut self, new_schema: crate::schema::Schema) -> crate::Result<crate::schema::Schema> {
+        // 1. Flush + commit pending docs under the OLD schema. The
+        //    resulting segments are sparse on whatever new fields are
+        //    about to be added.
+        self.commit()?;
+
+        // 2. Persist the extended schema. `Index::extend_schema` validates
+        //    that `new_schema` is a strict prefix extension and rewrites
+        //    meta.json atomically. If validation fails, the on-disk state
+        //    is left exactly as `self.commit()` left it.
+        self.index.extend_schema(new_schema)?;
+
+        // 3. Worker threads cache an `Index` clone (with its schema) at
+        //    spawn time, so the workers spawned by step 1's commit still
+        //    see the OLD schema. Drain and respawn them so future adds
+        //    use the extended schema.
+        self.recreate_document_channel();
+        let former_workers_join_handle = std::mem::take(&mut self.workers_join_handle);
+        for worker_handle in former_workers_join_handle {
+            worker_handle
+                .join()
+                .map_err(|e| TantivyError::ErrorInThread(format!("{e:?}")))??;
+        }
+        for _ in 0..self.options.num_worker_threads {
+            self.add_indexing_worker()?;
+        }
+        Ok(self.index.schema())
+    }
+
     pub(crate) fn segment_updater(&self) -> &SegmentUpdater {
         &self.segment_updater
     }

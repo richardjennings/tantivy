@@ -900,6 +900,91 @@ mod extend_schema_tests {
     }
 
     #[test]
+    fn index_writer_extend_schema_mid_batch() -> crate::Result<()> {
+        use crate::schema::Value;
+        // Build phase: write a few docs with the v1 schema, leave more
+        // pending in the writer (don't commit), call extend_schema on the
+        // writer, then write docs that reference the NEW field.
+        let mut index = Index::create_in_ram(build_schema_v1());
+        let title_v1 = index.schema().get_field("title")?;
+        let price_v1 = index.schema().get_field("price")?;
+
+        let mut writer: crate::IndexWriter = index.writer_for_tests()?;
+        for i in 0..50 {
+            writer.add_document(doc!(
+                title_v1 => format!("old doc {i}").as_str(),
+                price_v1 => (i as f64) * 1.5,
+            ))?;
+        }
+
+        // No explicit commit — extend_schema must drive the flush itself.
+        let new_schema = writer.extend_schema(build_schema_v2_add_color())?;
+
+        let title = new_schema.get_field("title")?;
+        let price = new_schema.get_field("price")?;
+        let color = new_schema.get_field("color")?;
+
+        // After extend_schema, the writer accepts docs referencing the new field.
+        for i in 0..30 {
+            writer.add_document(doc!(
+                title => format!("new doc {i}").as_str(),
+                price => (i as f64) * 0.5 + 100.0,
+                color => if i % 2 == 0 { "red" } else { "blue" },
+            ))?;
+        }
+        writer.commit()?;
+
+        // The outer `index` handle still has the OLD schema clone (`Index`
+        // and `IndexWriter` carry independent schema fields). Read via the
+        // writer's index handle, which is the one extend_schema mutated.
+        let reader = writer.index().reader()?;
+        let searcher = reader.searcher();
+        assert_eq!(searcher.num_docs(), 80);
+
+        // Old docs are queryable on the original fields.
+        use crate::collector::TopDocs;
+        use crate::query::TermQuery;
+        let q = TermQuery::new(
+            crate::Term::from_field_text(title, "old"),
+            crate::schema::IndexRecordOption::WithFreqsAndPositions,
+        );
+        assert_eq!(searcher.search(&q, &TopDocs::with_limit(100).order_by_score())?.len(), 50);
+
+        // New docs are queryable on the new field too.
+        let q = TermQuery::new(
+            crate::Term::from_field_text(color, "red"),
+            crate::schema::IndexRecordOption::Basic,
+        );
+        assert_eq!(
+            searcher.search(&q, &TopDocs::with_limit(100).order_by_score())?.len(),
+            15,
+            "new field 'color=red' matches half the new docs"
+        );
+
+        // Old docs are sparse on the new field — querying for any color
+        // value never returns an old doc.
+        for color_value in ["red", "blue", "green"] {
+            let q = TermQuery::new(
+                crate::Term::from_field_text(color, color_value),
+                crate::schema::IndexRecordOption::Basic,
+            );
+            let top = searcher.search(&q, &TopDocs::with_limit(100).order_by_score())?;
+            for (_score, addr) in top {
+                let doc: crate::TantivyDocument = searcher.doc(addr)?;
+                let title_text = doc
+                    .get_first(title)
+                    .and_then(|v| v.as_value().as_str())
+                    .unwrap_or("");
+                assert!(
+                    !title_text.starts_with("old "),
+                    "old doc should not match color={color_value}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn rejects_changing_an_existing_field_options() {
         let mut index = Index::create_in_ram(build_schema_v1());
         let mut sb = Schema::builder();
