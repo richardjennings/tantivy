@@ -42,6 +42,10 @@ pub use self::prepared_commit::PreparedCommit;
 pub use self::segment_entry::SegmentEntry;
 pub(crate) use self::segment_serializer::SegmentSerializer;
 pub use self::segment_updater::{merge_filtered_segments, merge_indices};
+// Needed by `Index::extend_schema` to atomically rewrite meta.json with the
+// extended schema. Kept pub(crate) to avoid exposing meta serialization as
+// part of tantivy's public API.
+pub(crate) use self::segment_updater::save_metas;
 pub use self::segment_writer::SegmentWriter;
 pub use self::single_segment_index_writer::SingleSegmentIndexWriter;
 

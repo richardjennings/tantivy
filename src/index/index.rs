@@ -639,6 +639,69 @@ impl Index {
         self.schema.clone()
     }
 
+    /// Extend the index's schema with additional fields appended at the end.
+    ///
+    /// `new_schema` MUST be a strict prefix extension of the current schema:
+    /// every field that was in the current schema must appear in
+    /// `new_schema` at the same position, with the same name, type, and
+    /// options. New fields may be appended after the existing ones (they
+    /// get new Field IDs assigned by `SchemaBuilder` in the usual way).
+    ///
+    /// This is the on-disk side of additive schema evolution. Existing
+    /// segments stay valid: their stored docs encode the old Field IDs,
+    /// which remain correctly positioned under the extended schema. The
+    /// segments are simply *sparse* on the new fields — exactly the same
+    /// semantics tantivy uses for any doc that doesn't set a value.
+    ///
+    /// The new schema is persisted to `meta.json` atomically. Any
+    /// `IndexWriter` / `IndexReader` opened before the extension still
+    /// holds a clone of the previous schema and must be re-opened to see
+    /// the new fields.
+    ///
+    /// Returns an error and leaves the on-disk state untouched if
+    /// `new_schema` is not a valid prefix extension.
+    pub fn extend_schema(&mut self, new_schema: Schema) -> crate::Result<()> {
+        // Validate prefix-extension property.
+        let current_fields: Vec<_> = self.schema.fields().collect();
+        let proposed_fields: Vec<_> = new_schema.fields().collect();
+        if proposed_fields.len() < current_fields.len() {
+            return Err(crate::TantivyError::SchemaError(format!(
+                "extend_schema: new schema has fewer fields ({}) than current ({}); \
+                 removing fields is not supported",
+                proposed_fields.len(),
+                current_fields.len(),
+            )));
+        }
+        for (idx, ((cur_field, cur_entry), (new_field, new_entry))) in
+            current_fields.iter().zip(proposed_fields.iter()).enumerate()
+        {
+            if cur_field.field_id() != new_field.field_id() {
+                return Err(crate::TantivyError::SchemaError(format!(
+                    "extend_schema: field at position {idx} changed id \
+                     ({} → {})",
+                    cur_field.field_id(),
+                    new_field.field_id(),
+                )));
+            }
+            if cur_entry != new_entry {
+                return Err(crate::TantivyError::SchemaError(format!(
+                    "extend_schema: existing field {:?} at position {idx} \
+                     was modified — name, type, options, or tokenizer changed",
+                    cur_entry.name(),
+                )));
+            }
+        }
+
+        // Persist. `save_metas` is `pub(crate)` so we use it directly here.
+        let mut meta = self.load_metas()?;
+        meta.schema = new_schema.clone();
+        crate::indexer::save_metas(&meta, &self.directory)?;
+        self.directory.sync_directory()?;
+
+        self.schema = new_schema;
+        Ok(())
+    }
+
     /// Returns the list of segments that are searchable
     pub fn searchable_segments(&self) -> crate::Result<Vec<Segment>> {
         Ok(self
@@ -710,5 +773,146 @@ impl Index {
 impl fmt::Debug for Index {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Index({:?})", self.directory)
+    }
+}
+
+#[cfg(test)]
+mod extend_schema_tests {
+    use super::*;
+    use crate::doc;
+    use crate::query::TermQuery;
+    use crate::schema::{IndexRecordOption, Schema, STORED, STRING, TEXT};
+    use crate::Term;
+
+    fn build_schema_v1() -> Schema {
+        let mut sb = Schema::builder();
+        sb.add_text_field("title", TEXT | STORED);
+        sb.add_f64_field("price", STORED | crate::schema::INDEXED);
+        sb.build()
+    }
+
+    fn build_schema_v2_add_color() -> Schema {
+        // Same fields at the same positions, plus `color` appended.
+        let mut sb = Schema::builder();
+        sb.add_text_field("title", TEXT | STORED);
+        sb.add_f64_field("price", STORED | crate::schema::INDEXED);
+        sb.add_text_field("color", STRING | STORED);
+        sb.build()
+    }
+
+    #[test]
+    fn extends_with_new_field_at_end() -> crate::Result<()> {
+        let mut index = Index::create_in_ram(build_schema_v1());
+        let title_v1 = index.schema().get_field("title")?;
+        let price_v1 = index.schema().get_field("price")?;
+
+        // Write some docs under v1.
+        {
+            let mut writer = index.writer_for_tests::<crate::TantivyDocument>()?;
+            writer.add_document(doc!(
+                title_v1 => "wireless headphones",
+                price_v1 => 79.99_f64,
+            ))?;
+            writer.add_document(doc!(
+                title_v1 => "usb cable",
+                price_v1 => 12.0_f64,
+            ))?;
+            writer.commit()?;
+        }
+
+        // Extend the schema in place.
+        let v2 = build_schema_v2_add_color();
+        index.extend_schema(v2.clone())?;
+        assert_eq!(index.schema().fields().count(), 3);
+
+        // Old segments still query correctly under the extended schema.
+        let title = index.schema().get_field("title")?;
+        let color = index.schema().get_field("color")?;
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let q = TermQuery::new(
+            Term::from_field_text(title, "wireless"),
+            IndexRecordOption::WithFreqsAndPositions,
+        );
+        use crate::collector::TopDocs;
+        let top = searcher.search(&q, &TopDocs::with_limit(10).order_by_score())?;
+        assert_eq!(top.len(), 1, "old segment still queryable on existing field");
+
+        // New field returns zero hits from old segment (sparse).
+        let q = TermQuery::new(
+            Term::from_field_text(color, "red"),
+            IndexRecordOption::Basic,
+        );
+        let top = searcher.search(&q, &TopDocs::with_limit(10).order_by_score())?;
+        assert!(top.is_empty(), "old segment has no values for the new field");
+
+        // New writes can use the extended schema.
+        {
+            let mut writer = index.writer_for_tests::<crate::TantivyDocument>()?;
+            writer.add_document(doc!(
+                title => "bluetooth speaker",
+                index.schema().get_field("price")? => 49.5_f64,
+                color => "red",
+            ))?;
+            writer.commit()?;
+        }
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        assert_eq!(searcher.num_docs(), 3);
+        let q = TermQuery::new(
+            Term::from_field_text(color, "red"),
+            IndexRecordOption::Basic,
+        );
+        assert_eq!(searcher.search(&q, &TopDocs::with_limit(10).order_by_score())?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_removing_a_field() {
+        let mut index = Index::create_in_ram(build_schema_v2_add_color());
+        // Try to "shrink" the schema by removing color.
+        let mut sb = Schema::builder();
+        sb.add_text_field("title", TEXT | STORED);
+        sb.add_f64_field("price", STORED | crate::schema::INDEXED);
+        let shrunk = sb.build();
+        let err = index.extend_schema(shrunk).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("fewer fields") || msg.contains("removing"),
+            "expected shrink-rejection error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_reordering_an_existing_field() {
+        let mut index = Index::create_in_ram(build_schema_v1());
+        // Swap title and price.
+        let mut sb = Schema::builder();
+        sb.add_f64_field("price", STORED | crate::schema::INDEXED);
+        sb.add_text_field("title", TEXT | STORED);
+        let reordered = sb.build();
+        let err = index.extend_schema(reordered).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("modified") || msg.contains("changed") || msg.contains("position"),
+            "expected reorder-rejection error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_changing_an_existing_field_options() {
+        let mut index = Index::create_in_ram(build_schema_v1());
+        let mut sb = Schema::builder();
+        // title becomes STRING instead of TEXT — different tokenizer
+        // (raw vs default) and different IndexRecordOption.
+        sb.add_text_field("title", STRING | STORED);
+        sb.add_f64_field("price", STORED | crate::schema::INDEXED);
+        let changed = sb.build();
+        let err = index.extend_schema(changed).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("modified") || msg.contains("changed") || msg.contains("options"),
+            "expected option-change rejection error, got: {msg}"
+        );
     }
 }
