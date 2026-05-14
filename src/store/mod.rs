@@ -410,6 +410,117 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// Regression: a segment whose doc store has a non-identity per-block
+    /// remap (produced by `StoreWriter::stack_with_remap`) must NOT be
+    /// byte-copied through `iter_raw` + `store_bytes` when re-merged. The
+    /// raw doc bytes carry the SOURCE-schema field ids; the trailer rescues
+    /// them at read time, but a byte-copy into a fresh empty-remap block
+    /// drops the trailer and corrupts the merged segment.
+    ///
+    /// `iter_doc_bytes_translated` decodes through the remap and re-encodes
+    /// against the target schema, producing bytes that are correct under
+    /// an empty trailer. This test builds a non-identity-remap V3 store
+    /// directly and verifies the translated bytes round-trip via the V3
+    /// reader.
+    #[test]
+    fn test_iter_doc_bytes_translated_rewrites_field_ids() -> crate::Result<()> {
+        // Source schema: just "title" (field id 0).
+        let source_schema = {
+            let mut sb = Schema::builder();
+            sb.add_text_field("title", TextOptions::default().set_stored());
+            sb.build()
+        };
+        // Target schema: ["prefix", "title"]; "title" is at field id 1.
+        let target_schema = {
+            let mut sb = Schema::builder();
+            sb.add_text_field("prefix", TextOptions::default().set_stored());
+            sb.add_text_field("title", TextOptions::default().set_stored());
+            sb.build()
+        };
+        let source_title = source_schema.get_field("title").unwrap();
+        let target_title = target_schema.get_field("title").unwrap();
+
+        let directory = RamDirectory::create();
+        let source_path = Path::new("source");
+        let stacked_path = Path::new("stacked");
+
+        // 1. Build a V3 source store with field id 0 ("title") in its bytes.
+        {
+            let wrt = directory.open_write(source_path)?;
+            let mut sw = StoreWriter::new(wrt, Compressor::Lz4, BLOCK_SIZE, false)?;
+            for i in 0..20 {
+                let mut doc = TantivyDocument::default();
+                doc.add_text(source_title, format!("doc {i}"));
+                sw.store(&doc, &source_schema)?;
+            }
+            sw.close()?;
+        }
+
+        // 2. Stack the source into a target store with the remap 0 → 1.
+        let source_reader =
+            StoreReader::open(directory.open_read(source_path)?, 10)?;
+        {
+            let wrt = directory.open_write(stacked_path)?;
+            let mut sw = StoreWriter::new(wrt, Compressor::Lz4, BLOCK_SIZE, false)?;
+            let remap = super::BlockFieldRemap::from_pairs(vec![(
+                source_title.field_id(),
+                target_title.field_id(),
+            )]);
+            sw.stack_with_remap(source_reader, remap)?;
+            sw.close()?;
+        }
+
+        // 3. Open the stacked store. Its bytes are STILL source-encoded
+        //    (field id 0), the trailer is what makes them readable as field
+        //    id 1 under the target schema.
+        let stacked_reader =
+            StoreReader::open(directory.open_read(stacked_path)?, 10)?;
+        assert!(
+            stacked_reader.has_non_identity_remap(),
+            "the stacked store should advertise a non-identity remap"
+        );
+
+        // 4. iter_doc_bytes_translated decodes through the trailer and
+        //    re-encodes against the target schema. Each emitted byte
+        //    sequence must decode (with EMPTY trailer) to docs whose
+        //    `title` field is reachable under the target schema's id.
+        let translated: Vec<Vec<u8>> = stacked_reader
+            .iter_doc_bytes_translated(&target_schema, None)
+            .collect::<crate::Result<Vec<_>>>()?;
+        assert_eq!(translated.len(), 20);
+
+        // Re-store the translated bytes into a fresh empty-remap target,
+        // then read back and confirm `title` is present at the TARGET id.
+        let merged_path = Path::new("merged");
+        {
+            let wrt = directory.open_write(merged_path)?;
+            let mut sw = StoreWriter::new(wrt, Compressor::Lz4, BLOCK_SIZE, false)?;
+            for bytes in &translated {
+                sw.store_bytes(bytes)?;
+            }
+            sw.close()?;
+        }
+        let merged_reader =
+            StoreReader::open(directory.open_read(merged_path)?, 10)?;
+        assert!(
+            !merged_reader.has_non_identity_remap(),
+            "merged-via-iter_doc_bytes_translated store has empty trailers"
+        );
+        for i in 0..20u32 {
+            let doc: TantivyDocument = merged_reader.get(i)?;
+            let title_value = doc
+                .get_first(target_title)
+                .and_then(|v| v.as_value().as_str())
+                .map(|s| s.to_string());
+            assert_eq!(
+                title_value.as_deref(),
+                Some(format!("doc {i}").as_str()),
+                "doc {i} title must be readable under the TARGET schema's title field id"
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn test_merge_of_small_segments() -> crate::Result<()> {
         let mut schema_builder = schema::Schema::builder();

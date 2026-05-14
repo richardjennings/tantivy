@@ -661,6 +661,32 @@ impl Index {
     /// Returns an error and leaves the on-disk state untouched if
     /// `new_schema` is not a valid prefix extension.
     pub fn extend_schema(&mut self, new_schema: Schema) -> crate::Result<()> {
+        // Acquire the same exclusive lock that `IndexWriter` creation takes,
+        // so a concurrent commit or end-merge in another process can't
+        // interleave with the meta.json read-modify-write below and clobber
+        // either change. Held for the duration of the load_metas + save_metas
+        // pair and dropped at function exit.
+        let _writer_lock = self
+            .directory
+            .acquire_lock(&INDEX_WRITER_LOCK)
+            .map_err(|err| {
+                TantivyError::LockFailure(
+                    err,
+                    Some(
+                        "extend_schema: could not acquire INDEX_WRITER_LOCK \
+                         — another IndexWriter is open on this directory."
+                            .to_string(),
+                    ),
+                )
+            })?;
+        self.extend_schema_no_lock(new_schema)
+    }
+
+    /// Internal counterpart to [`Index::extend_schema`] that skips the
+    /// directory lock acquisition. Used by [`crate::IndexWriter::extend_schema`]
+    /// because the writer already holds INDEX_WRITER_LOCK for its lifetime —
+    /// reacquiring would deadlock or fail with "lock already held".
+    pub(crate) fn extend_schema_no_lock(&mut self, new_schema: Schema) -> crate::Result<()> {
         // Validate prefix-extension property.
         let current_fields: Vec<_> = self.schema.fields().collect();
         let proposed_fields: Vec<_> = new_schema.fields().collect();
@@ -981,6 +1007,68 @@ mod extend_schema_tests {
                 );
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn index_writer_extend_schema_persists_to_meta_json() -> crate::Result<()> {
+        // Regression: SegmentUpdater holds its own Index clone with a
+        // frozen schema field, so without SegmentUpdater::set_schema the
+        // commit that follows `IndexWriter::extend_schema` writes the OLD
+        // schema back to meta.json — the extension survives in memory but
+        // is silently reverted on the next process restart.
+        use crate::directory::RamDirectory;
+
+        let directory = RamDirectory::create();
+        let index = Index::create(directory.clone(), build_schema_v1(), Default::default())?;
+        let title_v1 = index.schema().get_field("title")?;
+        let price_v1 = index.schema().get_field("price")?;
+
+        let mut writer: crate::IndexWriter = index.writer_for_tests()?;
+        for i in 0..30 {
+            writer.add_document(doc!(
+                title_v1 => format!("old doc {i}").as_str(),
+                price_v1 => (i as f64) * 1.5,
+            ))?;
+        }
+        let new_schema = writer.extend_schema(build_schema_v2_add_color())?;
+        let color = new_schema.get_field("color")?;
+        for i in 0..10 {
+            writer.add_document(doc!(
+                new_schema.get_field("title")? => format!("new doc {i}").as_str(),
+                new_schema.get_field("price")? => (i as f64) * 0.5,
+                color => "red",
+            ))?;
+        }
+        writer.commit()?;
+        drop(writer);
+
+        // Reopen the index from the directory — meta.json is the only source
+        // of truth here.
+        let reopened = Index::open(directory)?;
+        let schema_on_disk = reopened.schema();
+        assert!(
+            schema_on_disk.get_field("color").is_ok(),
+            "extend_schema-added field must survive in meta.json after commit"
+        );
+        assert_eq!(
+            schema_on_disk.fields().count(),
+            3,
+            "reopened schema should have all 3 fields (title, price, color)"
+        );
+
+        // And queries against the new field work on the reopened index.
+        let reader = reopened.reader()?;
+        let searcher = reader.searcher();
+        assert_eq!(searcher.num_docs(), 40);
+        let color = schema_on_disk.get_field("color")?;
+        let q = crate::query::TermQuery::new(
+            crate::Term::from_field_text(color, "red"),
+            crate::schema::IndexRecordOption::Basic,
+        );
+        use crate::collector::TopDocs;
+        let top = searcher.search(&q, &TopDocs::with_limit(100).order_by_score())?;
+        assert_eq!(top.len(), 10, "new field is queryable after reopen");
         Ok(())
     }
 

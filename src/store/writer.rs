@@ -157,12 +157,25 @@ impl StoreWriter {
     /// fast cross-schema re-segmenter path — no decompression, no
     /// recompression, no per-doc field rewrite.
     ///
-    /// `remap` should map each `encoded` field id appearing in the source's
-    /// docs to the target schema's field id. For freshly-written V3 sources
-    /// (the common case) the encoded ids ARE the source schema's field ids,
-    /// so the caller can construct `remap` directly from a `source_field_id
-    /// → target_field_id` table. Encoded ids not in `remap` fall through to
-    /// identity at read time.
+    /// `remap` is keyed by the **source schema's logical field ids** and
+    /// maps each to the target schema's field id. The caller should always
+    /// pass a `source_field_id → target_field_id` table, regardless of
+    /// whether the source was itself produced by an earlier translating
+    /// stack:
+    ///
+    /// - Fresh V3 source: encoded ids in the doc bytes ARE the source
+    ///   schema's logical ids, so `remap[source_id] = target_id` is applied
+    ///   directly to each encountered byte id.
+    /// - Already-translated V3 source: the source's own trailer is read and
+    ///   composed with the caller's `remap`, yielding a single combined
+    ///   trailer of the form `encoded_byte_id → target_id`. The caller
+    ///   doesn't see or care about the intermediate encoded byte ids — it
+    ///   still thinks in terms of `source_schema → target_schema`.
+    ///
+    /// Source schema ids absent from `remap` fall through to identity at
+    /// read time. V1 sources are rejected (V1 datetime values use
+    /// microseconds, V2/V3 nanoseconds — a byte-copy would silently rescale
+    /// every datetime by 1000x).
     pub fn stack_with_remap(
         &mut self,
         store_reader: StoreReader,

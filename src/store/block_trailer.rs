@@ -78,12 +78,19 @@ impl BlockFieldRemap {
 
     /// Serialize the trailer body (i.e. the part *before* the trailing
     /// `u32 trailer_byte_len`). For an empty remap, writes nothing.
+    ///
+    /// Entries are emitted in sorted order by encoded id so that the
+    /// resulting `.store` bytes are deterministic across runs — without
+    /// this, the underlying HashMap iteration order leaks into the file
+    /// and breaks reproducible builds / content-addressed segment hashing.
     pub fn serialize_body<W: Write + ?Sized>(&self, writer: &mut W) -> io::Result<()> {
         if self.is_empty() {
             return Ok(());
         }
-        VInt(self.len() as u64).serialize(writer)?;
-        for (encoded, target) in self.pairs() {
+        let mut entries: Vec<(u32, u32)> = self.map.iter().map(|(k, v)| (*k, *v)).collect();
+        entries.sort_unstable_by_key(|&(encoded, _)| encoded);
+        VInt(entries.len() as u64).serialize(writer)?;
+        for (encoded, target) in entries {
             VInt(encoded as u64).serialize(writer)?;
             VInt(target as u64).serialize(writer)?;
         }
@@ -189,5 +196,27 @@ mod tests {
         for &id in &[0u32, 1, 5, 999] {
             assert_eq!(remap.lookup(id), id);
         }
+    }
+
+    /// Regression: two `BlockFieldRemap`s built from the same set of pairs
+    /// must serialize to byte-identical trailers regardless of insertion
+    /// order. Without sorting in `serialize_body`, HashMap iteration order
+    /// (which is randomized per process via `RandomState`) would leak into
+    /// `.store` files.
+    #[test]
+    fn serialization_is_deterministic_across_insertion_orders() {
+        let pairs_a = [(5u32, 1u32), (2, 7), (9, 0), (1, 3), (12, 4)];
+        let mut pairs_b = pairs_a.to_vec();
+        pairs_b.reverse();
+        let remap_a = BlockFieldRemap::from_pairs(pairs_a);
+        let remap_b = BlockFieldRemap::from_pairs(pairs_b);
+        let mut buf_a = Vec::new();
+        let mut buf_b = Vec::new();
+        write_block_trailer(&mut buf_a, &remap_a).unwrap();
+        write_block_trailer(&mut buf_b, &remap_b).unwrap();
+        assert_eq!(
+            buf_a, buf_b,
+            "trailer bytes must be independent of HashMap iteration order"
+        );
     }
 }

@@ -24,6 +24,7 @@ use crate::indexer::{
     DefaultMergePolicy, MergeCandidate, MergeOperation, MergePolicy, SegmentEntry,
     SegmentSerializer,
 };
+use crate::schema::Schema;
 use crate::{FutureResult, Opstamp, TantivyError};
 
 const PANIC_CAUGHT: &str = "Panic caught in merge thread";
@@ -84,8 +85,15 @@ fn garbage_collect_files(
 
 /// Merges a list of segments the list of segment givens in the `segment_entries`.
 /// This function happens in the calling thread and is computationally expensive.
+///
+/// `schema` is passed explicitly (rather than read off `index.schema()`) so
+/// that mid-batch schema extensions via `IndexWriter::extend_schema` are
+/// honored: the writer's `Index` clone receives the new schema, but the
+/// `Index` clone owned by `SegmentUpdater` does not, and silently merging
+/// under the old schema would drop the newly-added fields.
 fn merge(
     index: &Index,
+    schema: Schema,
     mut segment_entries: Vec<SegmentEntry>,
     target_opstamp: Opstamp,
 ) -> crate::Result<Option<SegmentEntry>> {
@@ -114,7 +122,7 @@ fn merge(
         .collect();
 
     // An IndexMerger is like a "view" of our merged segments.
-    let merger: IndexMerger = IndexMerger::open(index.schema(), &segments[..])?;
+    let merger: IndexMerger = IndexMerger::open(schema, &segments[..])?;
 
     // ... we just serialize this index merger in our new segment to merge the segments.
     let segment_serializer = SegmentSerializer::for_segment(merged_segment.clone())?;
@@ -262,6 +270,14 @@ pub(crate) struct InnerSegmentUpdater {
     merge_thread_pool: ThreadPool,
 
     index: Index,
+    /// Schema written into `meta.json` on commit / end-merge.
+    ///
+    /// `index: Index` is a clone taken at `SegmentUpdater::create` time, so
+    /// mutations to the schema on the outer `IndexWriter::index` (via
+    /// `Index::extend_schema`) don't propagate here. Without this override
+    /// the next commit after `extend_schema` writes the *old* schema back
+    /// to `meta.json`, silently reverting the extension.
+    current_schema: RwLock<Schema>,
     segment_manager: SegmentManager,
     merge_policy: RwLock<Arc<dyn MergePolicy>>,
     killed: AtomicBool,
@@ -306,17 +322,28 @@ impl SegmentUpdater {
                 )
             })?;
         let index_meta = index.load_metas()?;
+        let current_schema = RwLock::new(index.schema());
         Ok(SegmentUpdater(Arc::new(InnerSegmentUpdater {
             active_index_meta: RwLock::new(Arc::new(index_meta)),
             pool,
             merge_thread_pool,
             index,
+            current_schema,
             segment_manager,
             merge_policy: RwLock::new(Arc::new(DefaultMergePolicy::default())),
             killed: AtomicBool::new(false),
             stamper,
             merge_operations: Default::default(),
         })))
+    }
+
+    /// Replace the schema written into `meta.json` on subsequent commits.
+    /// Called by [`crate::IndexWriter::extend_schema`] after the on-disk
+    /// schema has been atomically rewritten so that the next `commit` or
+    /// `end_merge` doesn't clobber the extension with the writer's stale
+    /// internal `Index` clone.
+    pub(crate) fn set_schema(&self, schema: Schema) {
+        *self.current_schema.write().unwrap() = schema;
     }
 
     pub fn get_merge_policy(&self) -> Arc<dyn MergePolicy> {
@@ -408,7 +435,7 @@ impl SegmentUpdater {
             let index_meta = IndexMeta {
                 index_settings: index.settings().clone(),
                 segments: committed_segment_metas,
-                schema: index.schema(),
+                schema: self.current_schema.read().unwrap().clone(),
                 opstamp,
                 payload: commit_message,
             };
@@ -518,9 +545,11 @@ impl SegmentUpdater {
             // Its lifetime is used to track how many merging thread are currently running,
             // as well as which segment is currently in merge and therefore should not be
             // candidate for another merge.
+            let schema_for_merge = segment_updater.current_schema.read().unwrap().clone();
             let merge_panic_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 merge(
                     &segment_updater.index,
+                    schema_for_merge,
                     segment_entries,
                     merge_operation.target_opstamp(),
                 )

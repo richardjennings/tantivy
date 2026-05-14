@@ -508,8 +508,16 @@ impl IndexMerger {
                     // take 7 in order to not walk over all checkpoints.
                     || store_reader.block_checkpoints().take(7).count() < 6
                     || store_reader.decompressor() != store_writer.compressor().into()
+                    // A non-identity per-block remap (V3 segments produced by
+                    // `stack_with_remap`) encodes source-schema field ids in
+                    // the doc bytes; copying those bytes verbatim into a fresh
+                    // empty-remap target block would silently corrupt the
+                    // merged segment. Force the translating slow path.
+                    || store_reader.has_non_identity_remap()
             {
-                for doc_bytes_res in store_reader.iter_raw(reader.alive_bitset()) {
+                for doc_bytes_res in
+                    store_reader.iter_doc_bytes_translated(&self.schema, reader.alive_bitset())
+                {
                     let doc_bytes = doc_bytes_res?;
                     store_writer.store_bytes(&doc_bytes)?;
                 }

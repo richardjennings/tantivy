@@ -15,7 +15,9 @@ use super::Decompressor;
 use crate::directory::FileSlice;
 use crate::error::DataCorruption;
 use crate::fastfield::AliveBitSet;
-use crate::schema::document::{BinaryDocumentDeserializer, DocumentDeserialize};
+use crate::schema::document::{
+    BinaryDocumentDeserializer, BinaryDocumentSerializer, DocumentDeserialize,
+};
 use crate::space_usage::StoreSpaceUsage;
 use crate::store::index::Checkpoint;
 use crate::DocId;
@@ -82,30 +84,35 @@ pub struct StoreReader {
     cache: BlockCache,
 }
 
-/// The cache for decompressed blocks.
+/// The cache for decompressed blocks, paired with their per-block
+/// field-id remap. Identity remap (the common V1/V2/fresh-V3 case) is
+/// represented by the shared default `Arc<BlockFieldRemap>` so the
+/// payload of a cache entry stays Block-sized except when a translating
+/// stack actually populated the trailer.
+type CachedBlock = (Block, Arc<super::block_trailer::BlockFieldRemap>);
 struct BlockCache {
-    cache: Option<Mutex<LruCache<usize, Block>>>,
+    cache: Option<Mutex<LruCache<usize, CachedBlock>>>,
     cache_hits: AtomicUsize,
     cache_misses: AtomicUsize,
 }
 
 impl BlockCache {
-    fn get_from_cache(&self, pos: usize) -> Option<Block> {
-        if let Some(block) = self
+    fn get_from_cache(&self, pos: usize) -> Option<CachedBlock> {
+        if let Some(entry) = self
             .cache
             .as_ref()
             .and_then(|cache| cache.lock().unwrap().get(&pos).cloned())
         {
             self.cache_hits.fetch_add(1, Ordering::SeqCst);
-            return Some(block);
+            return Some(entry);
         }
         self.cache_misses.fetch_add(1, Ordering::SeqCst);
         None
     }
 
-    fn put_into_cache(&self, pos: usize, data: Block) {
+    fn put_into_cache(&self, pos: usize, block: Block, remap: Arc<super::block_trailer::BlockFieldRemap>) {
         if let Some(cache) = self.cache.as_ref() {
-            cache.lock().unwrap().put(pos, data);
+            cache.lock().unwrap().put(pos, (block, remap));
         }
     }
 
@@ -249,43 +256,38 @@ impl StoreReader {
     ///
     /// Advanced API. In most cases use [`get`](Self::get).
     fn read_block(&self, checkpoint: &Checkpoint) -> io::Result<Block> {
-        let cache_key = checkpoint.byte_range.start;
-        if let Some(block) = self.cache.get_from_cache(cache_key) {
-            return Ok(block);
-        }
-
-        let block_bytes = self.get_compressed_block(checkpoint)?;
-        let (compressed_payload, _remap) = self.split_block_trailer(block_bytes)?;
-        let decompressed_block =
-            OwnedBytes::new(self.decompressor.decompress(compressed_payload.as_ref())?);
-
-        self.cache
-            .put_into_cache(cache_key, decompressed_block.clone());
-
-        Ok(decompressed_block)
+        let (block, _remap) = self.read_block_with_remap(checkpoint)?;
+        Ok(block)
     }
 
     /// Load the block and also return the per-block field remap. The remap
     /// is identity (no-op) on V1/V2 blocks and on V3 blocks written by a
     /// normal `StoreWriter`; only blocks emitted by a translating-`stack`
     /// path carry non-identity entries.
+    ///
+    /// On a cache hit the FileSlice is not touched at all — both the
+    /// decompressed payload and the per-block remap are read from the LRU
+    /// entry. This keeps remote/network directories (Quickwit-style FS)
+    /// from paying for a fresh range fetch on every `get`.
     fn read_block_with_remap(
         &self,
         checkpoint: &Checkpoint,
-    ) -> io::Result<(Block, super::block_trailer::BlockFieldRemap)> {
-        // Bypass the LRU cache for the remap path because the cache only
-        // stores decompressed bytes, not the trailer. Re-reading the trailer
-        // from the FileSlice is cheap (last 4 bytes + a varint list).
+    ) -> io::Result<(Block, Arc<super::block_trailer::BlockFieldRemap>)> {
+        let cache_key = checkpoint.byte_range.start;
+        if let Some((cached_block, cached_remap)) = self.cache.get_from_cache(cache_key) {
+            return Ok((cached_block, cached_remap));
+        }
+
         let block_bytes = self.get_compressed_block(checkpoint)?;
         let (compressed_payload, remap) = self.split_block_trailer(block_bytes)?;
+        let decompressed_block =
+            OwnedBytes::new(self.decompressor.decompress(compressed_payload.as_ref())?);
+        let remap_arc = Arc::new(remap);
 
-        if let Some(cached) = self.cache.get_from_cache(checkpoint.byte_range.start) {
-            return Ok((cached, remap));
-        }
-        let decompressed = OwnedBytes::new(self.decompressor.decompress(compressed_payload.as_ref())?);
         self.cache
-            .put_into_cache(checkpoint.byte_range.start, decompressed.clone());
-        Ok((decompressed, remap))
+            .put_into_cache(cache_key, decompressed_block.clone(), Arc::clone(&remap_arc));
+
+        Ok((decompressed_block, remap_arc))
     }
 
     /// Reads a given document.
@@ -301,7 +303,7 @@ impl StoreReader {
         let checkpoint = self.block_checkpoint(doc_id)?;
         let (block, remap) = self.read_block_with_remap(&checkpoint)?;
         let mut doc_bytes = Self::get_document_bytes_from_block(block, doc_id, &checkpoint)?;
-        let remap_ref = if remap.is_empty() { None } else { Some(&remap) };
+        let remap_ref = if remap.is_empty() { None } else { Some(remap.as_ref()) };
         let deserializer = BinaryDocumentDeserializer::from_reader_with_remap(
             &mut doc_bytes,
             self.doc_store_version,
@@ -347,7 +349,7 @@ impl StoreReader {
         self.iter_raw_with_remap(alive_bitset)
             .map(|res| {
                 let (mut doc_bytes, remap) = res?;
-                let remap_ref = if remap.is_empty() { None } else { Some(&remap) };
+                let remap_ref = if remap.is_empty() { None } else { Some(remap.as_ref()) };
                 let deserializer = BinaryDocumentDeserializer::from_reader_with_remap(
                     &mut doc_bytes,
                     self.doc_store_version,
@@ -364,7 +366,7 @@ impl StoreReader {
     fn iter_raw_with_remap<'a: 'b, 'b>(
         &'b self,
         alive_bitset: Option<&'a AliveBitSet>,
-    ) -> impl Iterator<Item = crate::Result<(OwnedBytes, super::block_trailer::BlockFieldRemap)>> + 'b
+    ) -> impl Iterator<Item = crate::Result<(OwnedBytes, Arc<super::block_trailer::BlockFieldRemap>)>> + 'b
     {
         let last_doc_id = self
             .block_checkpoints()
@@ -475,6 +477,70 @@ impl StoreReader {
             })
     }
 
+    /// Like [`iter_raw`](Self::iter_raw) but rewrites per-block field-id
+    /// remap trailers into the doc bytes themselves, so the returned bytes
+    /// encode the surrounding (target) schema's field ids directly. Used by
+    /// the merger when copying docs from a segment produced by a translating
+    /// `stack_with_remap` into a fresh empty-remap block — without this
+    /// translation, the bytes would carry the source schema's encoded field
+    /// ids and the per-block trailer would be silently dropped, corrupting
+    /// the merged segment.
+    ///
+    /// Identity remap blocks (the common case) short-circuit to a raw byte
+    /// copy with no decode/re-encode overhead.
+    pub(crate) fn iter_doc_bytes_translated<'a: 'b, 'b>(
+        &'b self,
+        target_schema: &'b crate::schema::Schema,
+        alive_bitset: Option<&'a AliveBitSet>,
+    ) -> impl Iterator<Item = crate::Result<Vec<u8>>> + 'b {
+        let version = self.doc_store_version;
+        self.iter_raw_with_remap(alive_bitset).map(move |res| {
+            let (mut doc_bytes, remap) = res?;
+            if remap.is_empty() {
+                return Ok(doc_bytes.as_slice().to_vec());
+            }
+            let deserializer = BinaryDocumentDeserializer::from_reader_with_remap(
+                &mut doc_bytes,
+                version,
+                Some(remap.as_ref()),
+            )
+            .map_err(crate::TantivyError::from)?;
+            let doc: crate::TantivyDocument =
+                crate::TantivyDocument::deserialize(deserializer)
+                    .map_err(crate::TantivyError::from)?;
+            let mut out: Vec<u8> = Vec::with_capacity(doc_bytes.len());
+            let mut serializer = BinaryDocumentSerializer::new(&mut out, target_schema);
+            serializer.serialize_doc(&doc)?;
+            Ok(out)
+        })
+    }
+
+    /// True if any block in this store has a non-identity remap trailer.
+    /// Cheap pre-check for the merger's slow path: V1/V2 stores trivially
+    /// return false, V3 stores scan block trailers (last 4 bytes per block).
+    pub(crate) fn has_non_identity_remap(&self) -> bool {
+        if self.doc_store_version < DocStoreVersion::V3 {
+            return false;
+        }
+        for checkpoint in self.block_checkpoints() {
+            let Ok(block_bytes) = self.get_compressed_block(&checkpoint) else {
+                // I/O error here will surface again in the actual read; treat
+                // as "might have remap" so the caller takes the safe slow path.
+                return true;
+            };
+            let Ok((_, trailer_byte_len)) =
+                super::block_trailer::read_block_trailer(block_bytes.as_ref())
+            else {
+                return true;
+            };
+            // 4 == empty trailer (just the u32 length itself).
+            if trailer_byte_len > 4 {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Summarize total space usage of this store reader.
     pub fn space_usage(&self) -> StoreSpaceUsage {
         self.space_usage.clone()
@@ -509,37 +575,61 @@ impl StoreReader {
     ///
     /// In most cases use [`get_async`](Self::get_async)
     ///
-    /// Loads and decompresses a block asynchronously.
+    /// Loads and decompresses a block asynchronously, stripping the V3
+    /// per-block remap trailer (if any) before handing bytes to the
+    /// decompressor.
     async fn read_block_async(
         &self,
         checkpoint: &Checkpoint,
         executor: &Executor,
     ) -> io::Result<Block> {
+        let (block, _remap) = self.read_block_with_remap_async(checkpoint, executor).await?;
+        Ok(block)
+    }
+
+    /// Async counterpart of [`read_block_with_remap`](Self::read_block_with_remap).
+    /// Returns both the decompressed payload and any per-block field-id
+    /// remap encoded in the V3 trailer; V1/V2 blocks always return an
+    /// empty remap (identity).
+    ///
+    /// On a cache hit the FileSlice is not fetched at all — both payload
+    /// and remap come from the LRU entry, matching the sync path.
+    async fn read_block_with_remap_async(
+        &self,
+        checkpoint: &Checkpoint,
+        executor: &Executor,
+    ) -> io::Result<(Block, Arc<super::block_trailer::BlockFieldRemap>)> {
         let cache_key = checkpoint.byte_range.start;
-        if let Some(block) = self.cache.get_from_cache(checkpoint.byte_range.start) {
-            return Ok(block);
+        if let Some((cached_block, cached_remap)) = self.cache.get_from_cache(cache_key) {
+            return Ok((cached_block, cached_remap));
         }
 
-        let compressed_block = self
+        let block_bytes = self
             .data
             .slice(checkpoint.byte_range.clone())
             .read_bytes_async()
             .await?;
+        let (compressed_payload, remap) = self.split_block_trailer(block_bytes)?;
 
         let decompressor = self.decompressor;
         let maybe_decompressed_block = executor
-            .spawn_blocking(move || decompressor.decompress(compressed_block.as_ref()))
+            .spawn_blocking(move || decompressor.decompress(compressed_payload.as_ref()))
             .await
             .expect("decompression panicked");
         let decompressed_block = OwnedBytes::new(maybe_decompressed_block?);
+        let remap_arc = Arc::new(remap);
 
         self.cache
-            .put_into_cache(cache_key, decompressed_block.clone());
+            .put_into_cache(cache_key, decompressed_block.clone(), Arc::clone(&remap_arc));
 
-        Ok(decompressed_block)
+        Ok((decompressed_block, remap_arc))
     }
 
     /// Reads raw bytes of a given document asynchronously.
+    ///
+    /// Note: for V3 blocks with a non-identity remap, these bytes encode the
+    /// SOURCE schema's field ids and require trailer-aware decoding. Prefer
+    /// [`get_async`](Self::get_async) for typed documents.
     pub async fn get_document_bytes_async(
         &self,
         doc_id: DocId,
@@ -556,11 +646,16 @@ impl StoreReader {
         doc_id: DocId,
         executor: &Executor,
     ) -> crate::Result<D> {
-        let mut doc_bytes = self.get_document_bytes_async(doc_id, executor).await?;
-
-        let deserializer =
-            BinaryDocumentDeserializer::from_reader(&mut doc_bytes, self.doc_store_version)
-                .map_err(crate::TantivyError::from)?;
+        let checkpoint = self.block_checkpoint(doc_id)?;
+        let (block, remap) = self.read_block_with_remap_async(&checkpoint, executor).await?;
+        let mut doc_bytes = Self::get_document_bytes_from_block(block, doc_id, &checkpoint)?;
+        let remap_ref = if remap.is_empty() { None } else { Some(remap.as_ref()) };
+        let deserializer = BinaryDocumentDeserializer::from_reader_with_remap(
+            &mut doc_bytes,
+            self.doc_store_version,
+            remap_ref,
+        )
+        .map_err(crate::TantivyError::from)?;
         D::deserialize(deserializer).map_err(crate::TantivyError::from)
     }
 }

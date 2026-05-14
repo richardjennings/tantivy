@@ -183,13 +183,31 @@ impl BlockCompressorImpl {
     /// in the store and adding them one by one, as the store's data will
     /// not be decompressed and then recompressed.
     ///
-    /// Handles version mismatch: when stacking a V1/V2 source into a V3
+    /// Handles version mismatch: when stacking a V2 source into a V3
     /// target (or any target ≥ V3 — DOC_STORE_VERSION is V3 today), each
     /// source block is walked individually so an empty V3 trailer can be
     /// injected after its compressed payload. The compressed bytes
     /// themselves are still byte-copied — no decompression. This is what
-    /// makes pre-V3 indexes safe to merge through a V3-default writer.
+    /// makes V2 indexes safe to merge through a V3-default writer.
+    ///
+    /// V1 sources are rejected: V1 stores datetime values as microseconds,
+    /// V2/V3 as nanoseconds, and the byte-copy path can't translate one to
+    /// the other. The corresponding upstream `stack` for a V1→V2 target
+    /// has always carried the same hazard silently — fail loudly instead.
     fn stack(&mut self, store_reader: StoreReader) -> io::Result<()> {
+        if store_reader.doc_store_version() < DocStoreVersion::V2 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "stack: source doc store is {}; only V2+ sources can be \
+                     byte-stacked because V1 datetime values use microseconds \
+                     (V2+ uses nanoseconds) and the byte-copy path can't \
+                     rescale them. Migrate the segment via a doc-by-doc \
+                     rebuild before stacking.",
+                    store_reader.doc_store_version()
+                ),
+            ));
+        }
         if store_reader.doc_store_version() >= DocStoreVersion::V3 {
             // V3 source: blocks already carry trailers — bulk byte-copy.
             let doc_shift = self.first_doc_in_block;
@@ -239,6 +257,27 @@ impl BlockCompressorImpl {
         let doc_shift = self.first_doc_in_block;
         let source_block_data = store_reader.block_data()?;
         let source_version = store_reader.doc_store_version();
+        // V1 encodes datetime values as i64 microseconds; V2/V3 encode them
+        // as i64 nanoseconds. Byte-copying V1 blocks into a V3 target keeps
+        // the bytes intact but the V3 footer makes the reader interpret
+        // them as nanoseconds — silently rescaling every datetime by 1000.
+        // Rejecting here matches the upstream `stack` behavior for V1
+        // sources (which has always shared the same hazard) and keeps the
+        // re-segmenter honest. Callers with V1 indexes must migrate the
+        // segment through a full doc-by-doc rewrite first.
+        if source_version < DocStoreVersion::V2 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "stack_with_remap: source doc store is {source_version}; \
+                     only V2+ sources can be byte-stacked into a V3 target \
+                     because V1 datetime values are stored as microseconds \
+                     (V2+ uses nanoseconds) and a byte-copy would rescale \
+                     every datetime by 1000x. Re-encode the source via a \
+                     standard doc-by-doc rebuild first."
+                ),
+            ));
+        }
         let source_checkpoints: Vec<Checkpoint> = store_reader.block_checkpoints().collect();
 
         for checkpoint in source_checkpoints {

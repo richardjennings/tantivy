@@ -699,13 +699,21 @@ impl<D: Document> IndexWriter<D> {
         //    about to be added.
         self.commit()?;
 
-        // 2. Persist the extended schema. `Index::extend_schema` validates
-        //    that `new_schema` is a strict prefix extension and rewrites
-        //    meta.json atomically. If validation fails, the on-disk state
-        //    is left exactly as `self.commit()` left it.
-        self.index.extend_schema(new_schema)?;
+        // 2. Persist the extended schema. The writer already holds
+        //    INDEX_WRITER_LOCK so we use the no-lock variant —
+        //    `Index::extend_schema` would deadlock trying to reacquire it.
+        //    Validation (strict prefix extension) and the atomic meta.json
+        //    rewrite still happen here.
+        self.index.extend_schema_no_lock(new_schema)?;
 
-        // 3. Worker threads cache an `Index` clone (with its schema) at
+        // 3. Propagate the schema to the segment updater. SegmentUpdater
+        //    holds its own `Index` clone with a frozen schema field; without
+        //    this set_schema call, the next commit or end-merge would write
+        //    the OLD schema back into `meta.json` and silently revert the
+        //    extension on the next process restart.
+        self.segment_updater.set_schema(self.index.schema());
+
+        // 4. Worker threads cache an `Index` clone (with its schema) at
         //    spawn time, so the workers spawned by step 1's commit still
         //    see the OLD schema. Drain and respawn them so future adds
         //    use the extended schema.
