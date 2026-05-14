@@ -224,6 +224,24 @@ pub struct IndexSettings {
     #[serde(default = "default_docstore_blocksize")]
     /// The size of each block that will be compressed and written to disk
     pub docstore_blocksize: usize,
+    /// The doc store on-disk format version used for newly written
+    /// segments. Defaults to [`crate::store::DOC_STORE_VERSION`] (V3 at
+    /// the time of writing). The only reason to override is to produce
+    /// legacy V2 segments for migration tests; V2 readers cannot decode
+    /// V3 trailers, but V3 readers handle V1/V2/V3 transparently. Once
+    /// written, the on-disk version is fixed for that segment — toggling
+    /// this field afterward affects only subsequent writes.
+    #[serde(default = "default_docstore_version")]
+    #[serde(skip_serializing_if = "is_default_docstore_version")]
+    pub docstore_version: crate::store::DocStoreVersion,
+}
+
+fn default_docstore_version() -> crate::store::DocStoreVersion {
+    crate::store::DOC_STORE_VERSION
+}
+
+fn is_default_docstore_version(v: &crate::store::DocStoreVersion) -> bool {
+    *v == crate::store::DOC_STORE_VERSION
 }
 
 /// Must be a function to be compatible with serde defaults
@@ -237,6 +255,7 @@ impl Default for IndexSettings {
             docstore_compression: Compressor::default(),
             docstore_blocksize: default_docstore_blocksize(),
             docstore_compress_dedicated_thread: true,
+            docstore_version: default_docstore_version(),
         }
     }
 }
@@ -406,6 +425,7 @@ mod tests {
                 }),
                 docstore_blocksize: 1_000_000,
                 docstore_compress_dedicated_thread: true,
+                docstore_version: crate::store::DOC_STORE_VERSION,
             },
             segments: Vec::new(),
             schema,
@@ -471,7 +491,8 @@ mod tests {
             IndexSettings {
                 docstore_compression: Compressor::default(),
                 docstore_compress_dedicated_thread: true,
-                docstore_blocksize: 16_384
+                docstore_blocksize: 16_384,
+                docstore_version: crate::store::DOC_STORE_VERSION,
             }
         );
         {

@@ -47,10 +47,11 @@ impl StoreWriter {
     }
 
     /// Same as [`Self::new`] but with an explicit on-disk format version.
-    /// Used in tests to construct legacy V2 fixtures that exercise the
-    /// V2→V3 cross-version stack path; production callers should stick
-    /// with [`Self::new`].
-    pub(crate) fn new_with_version(
+    /// Used to construct legacy V2 fixtures (e.g. migration tests that
+    /// exercise the V2→V3 cross-version stack path). Production callers
+    /// should stick with [`Self::new`] or set
+    /// [`crate::IndexSettings::docstore_version`] on the owning index.
+    pub fn new_with_version(
         writer: WritePtr,
         compressor: Compressor,
         block_size: usize,

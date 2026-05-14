@@ -22,11 +22,12 @@ impl SegmentSerializer {
         let settings = segment.index().settings().clone();
         let store_writer = {
             let store_write = segment.open_write(SegmentComponent::Store)?;
-            StoreWriter::new(
+            StoreWriter::new_with_version(
                 store_write,
                 settings.docstore_compression,
                 settings.docstore_blocksize,
                 settings.docstore_compress_dedicated_thread,
+                settings.docstore_version,
             )?
         };
 

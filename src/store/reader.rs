@@ -39,10 +39,27 @@ type Block = OwnedBytes;
 /// another segment's compressed `.store` blocks byte-for-byte under a
 /// different target schema — the heavy lift for re-segmenting across
 /// incompatible schemas. See `tantivy/src/store/block_trailer.rs`.
-#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
-pub(crate) enum DocStoreVersion {
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum DocStoreVersion {
+    /// Pre-0.23 doc store (no per-block header).
     V1 = 1,
+    /// 0.23-onwards baseline format. V3 readers handle V2 transparently.
     V2 = 2,
+    /// Fork addition: V2 plus an optional per-block field-id remap
+    /// trailer to support cross-schema segment stacking. Production
+    /// callers should always write V3; V2 is preserved for tests and
+    /// for indexes that pre-date the fork.
     V3 = 3,
 }
 impl Display for DocStoreVersion {
@@ -227,7 +244,10 @@ impl StoreReader {
     /// On-disk format version of this store. Mainly useful to a
     /// translating-`stack` path that needs to know whether source blocks
     /// already carry V3 trailers.
-    pub(crate) fn doc_store_version(&self) -> DocStoreVersion {
+    /// Returns the on-disk format version of this doc store. Useful for
+    /// migration tests that need to assert a segment was actually
+    /// written in the expected legacy format.
+    pub fn doc_store_version(&self) -> DocStoreVersion {
         self.doc_store_version
     }
 
