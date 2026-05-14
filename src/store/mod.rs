@@ -29,6 +29,7 @@
 //!   method](../struct.SegmentReader.html#method.doc)
 //! - at the index level, the [`Searcher::doc()`](crate::Searcher::doc) method
 
+mod block_trailer;
 mod compressors;
 mod decompressors;
 mod footer;
@@ -36,6 +37,12 @@ mod index;
 mod reader;
 mod writer;
 
+// `BlockFieldRemap` is public so external crates (the resegmenter, custom
+// `StoreWriter::stack_with_remap` callers) can construct the per-block
+// translation table. `write_block_trailer` / `read_block_trailer` stay
+// pub(crate) since they're internal serialization helpers.
+pub use self::block_trailer::BlockFieldRemap;
+pub(crate) use self::block_trailer::{read_block_trailer, write_block_trailer};
 pub use self::compressors::{Compressor, ZstdCompressor};
 pub use self::decompressors::Decompressor;
 pub use self::reader::{CacheStats, StoreReader};
@@ -44,7 +51,11 @@ pub use self::writer::StoreWriter;
 mod store_compressor;
 
 /// Doc store version in footer to handle format changes.
-pub(crate) const DOC_STORE_VERSION: DocStoreVersion = DocStoreVersion::V2;
+///
+/// New indexes default to V3 (per-block remap trailer support). V3 with an
+/// empty remap is wire-compatible with V2 except for an extra 4 bytes
+/// (`trailer_byte_len = 4`) per block — readers honour it transparently.
+pub(crate) const DOC_STORE_VERSION: DocStoreVersion = DocStoreVersion::V3;
 
 #[cfg(feature = "lz4-compression")]
 mod compression_lz4_block;

@@ -22,7 +22,7 @@ use super::se::BinaryObjectSerializer;
 use super::{OwnedValue, Value};
 use crate::schema::document::type_codes;
 use crate::schema::{Facet, Field};
-use crate::store::DocStoreVersion;
+use crate::store::{BlockFieldRemap, DocStoreVersion};
 use crate::tokenizer::PreTokenizedString;
 
 #[derive(Debug, thiserror::Error, Clone)]
@@ -296,6 +296,10 @@ pub struct BinaryDocumentDeserializer<'de, R> {
     length: usize,
     position: usize,
     doc_store_version: DocStoreVersion,
+    /// Per-block field-id remap, applied to every Field encountered as we
+    /// deserialize each tuple. `None` (or an empty remap) is the identity
+    /// fast path used by every V1/V2 block and by freshly-written V3 blocks.
+    field_remap: Option<&'de BlockFieldRemap>,
     reader: &'de mut R,
 }
 
@@ -307,12 +311,24 @@ where R: Read
         reader: &'de mut R,
         doc_store_version: DocStoreVersion,
     ) -> Result<Self, DeserializeError> {
+        Self::from_reader_with_remap(reader, doc_store_version, None)
+    }
+
+    /// Same as [`from_reader`] but threads a per-block field-id remap so
+    /// stacked blocks under a target schema can map their encoded field ids
+    /// back to the surrounding index's schema fields on the read path.
+    pub(crate) fn from_reader_with_remap(
+        reader: &'de mut R,
+        doc_store_version: DocStoreVersion,
+        field_remap: Option<&'de BlockFieldRemap>,
+    ) -> Result<Self, DeserializeError> {
         let length = VInt::deserialize(reader)?;
 
         Ok(Self {
             length: length.val() as usize,
             position: 0,
             doc_store_version,
+            field_remap,
             reader,
         })
     }
@@ -337,7 +353,12 @@ where R: Read
             return Ok(None);
         }
 
-        let field = Field::deserialize(self.reader).map_err(DeserializeError::from)?;
+        let raw_field = Field::deserialize(self.reader).map_err(DeserializeError::from)?;
+        let field = if let Some(remap) = self.field_remap {
+            Field::from_field_id(remap.lookup(raw_field.field_id()))
+        } else {
+            raw_field
+        };
         let deserializer =
             BinaryValueDeserializer::from_reader(self.reader, self.doc_store_version)?;
         let value = V::deserialize(deserializer)?;
@@ -460,7 +481,9 @@ where R: Read
                 let timestamp_micros = <i64 as BinarySerializable>::deserialize(self.reader)?;
                 Ok(DateTime::from_timestamp_micros(timestamp_micros))
             }
-            DocStoreVersion::V2 => {
+            // V2 and V3 share the value encoding — V3 only differs in the
+            // per-block remap trailer, not in how a single value is laid out.
+            DocStoreVersion::V2 | DocStoreVersion::V3 => {
                 let timestamp_nanos = <i64 as BinarySerializable>::deserialize(self.reader)?;
                 Ok(DateTime::from_timestamp_nanos(timestamp_nanos))
             }

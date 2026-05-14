@@ -27,16 +27,28 @@ pub(crate) const DOCSTORE_CACHE_CAPACITY: usize = 100;
 type Block = OwnedBytes;
 
 /// The format version of the document store.
+///
+/// **V3** adds a per-block remap trailer: `[compressed_payload]
+/// [optional VInt-encoded (encoded_field, target_field) remap pairs]
+/// [u32 trailer_byte_len]`. When `trailer_byte_len == 4` the remap is empty
+/// and reads behave like V2 (encoded field ids ARE the schema field ids).
+/// When non-empty, every field id encountered inside the doc record is
+/// translated through the remap on read. This allows `StoreWriter` to stack
+/// another segment's compressed `.store` blocks byte-for-byte under a
+/// different target schema — the heavy lift for re-segmenting across
+/// incompatible schemas. See `tantivy/src/store/block_trailer.rs`.
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
 pub(crate) enum DocStoreVersion {
     V1 = 1,
     V2 = 2,
+    V3 = 3,
 }
 impl Display for DocStoreVersion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DocStoreVersion::V1 => write!(f, "V1"),
             DocStoreVersion::V2 => write!(f, "V2"),
+            DocStoreVersion::V3 => write!(f, "V3"),
         }
     }
 }
@@ -49,6 +61,7 @@ impl BinarySerializable for DocStoreVersion {
         Ok(match u32::deserialize(reader)? {
             1 => DocStoreVersion::V1,
             2 => DocStoreVersion::V2,
+            3 => DocStoreVersion::V3,
             v => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -204,8 +217,32 @@ impl StoreReader {
         self.data.read_bytes()
     }
 
+    /// On-disk format version of this store. Mainly useful to a
+    /// translating-`stack` path that needs to know whether source blocks
+    /// already carry V3 trailers.
+    pub(crate) fn doc_store_version(&self) -> DocStoreVersion {
+        self.doc_store_version
+    }
+
     fn get_compressed_block(&self, checkpoint: &Checkpoint) -> io::Result<OwnedBytes> {
         self.data.slice(checkpoint.byte_range.clone()).read_bytes()
+    }
+
+    /// Split a V3 block-bytes slice into `(compressed_payload, remap)`.
+    ///
+    /// For V1/V2 (no trailer) we treat the whole slice as compressed payload
+    /// and return an empty remap (= identity, no-op at field-id lookup time).
+    fn split_block_trailer(
+        &self,
+        block_bytes: OwnedBytes,
+    ) -> io::Result<(OwnedBytes, super::block_trailer::BlockFieldRemap)> {
+        if self.doc_store_version < DocStoreVersion::V3 {
+            return Ok((block_bytes, super::block_trailer::BlockFieldRemap::default()));
+        }
+        let (remap, trailer_byte_len) =
+            super::block_trailer::read_block_trailer(block_bytes.as_ref())?;
+        let payload_end = block_bytes.len() - trailer_byte_len;
+        Ok((block_bytes.slice(0..payload_end), remap))
     }
 
     /// Loads and decompresses a block.
@@ -217,14 +254,38 @@ impl StoreReader {
             return Ok(block);
         }
 
-        let compressed_block = self.get_compressed_block(checkpoint)?;
+        let block_bytes = self.get_compressed_block(checkpoint)?;
+        let (compressed_payload, _remap) = self.split_block_trailer(block_bytes)?;
         let decompressed_block =
-            OwnedBytes::new(self.decompressor.decompress(compressed_block.as_ref())?);
+            OwnedBytes::new(self.decompressor.decompress(compressed_payload.as_ref())?);
 
         self.cache
             .put_into_cache(cache_key, decompressed_block.clone());
 
         Ok(decompressed_block)
+    }
+
+    /// Load the block and also return the per-block field remap. The remap
+    /// is identity (no-op) on V1/V2 blocks and on V3 blocks written by a
+    /// normal `StoreWriter`; only blocks emitted by a translating-`stack`
+    /// path carry non-identity entries.
+    fn read_block_with_remap(
+        &self,
+        checkpoint: &Checkpoint,
+    ) -> io::Result<(Block, super::block_trailer::BlockFieldRemap)> {
+        // Bypass the LRU cache for the remap path because the cache only
+        // stores decompressed bytes, not the trailer. Re-reading the trailer
+        // from the FileSlice is cheap (last 4 bytes + a varint list).
+        let block_bytes = self.get_compressed_block(checkpoint)?;
+        let (compressed_payload, remap) = self.split_block_trailer(block_bytes)?;
+
+        if let Some(cached) = self.cache.get_from_cache(checkpoint.byte_range.start) {
+            return Ok((cached, remap));
+        }
+        let decompressed = OwnedBytes::new(self.decompressor.decompress(compressed_payload.as_ref())?);
+        self.cache
+            .put_into_cache(checkpoint.byte_range.start, decompressed.clone());
+        Ok((decompressed, remap))
     }
 
     /// Reads a given document.
@@ -237,11 +298,16 @@ impl StoreReader {
     /// It should not be called to score documents
     /// for instance.
     pub fn get<D: DocumentDeserialize>(&self, doc_id: DocId) -> crate::Result<D> {
-        let mut doc_bytes = self.get_document_bytes(doc_id)?;
-
-        let deserializer =
-            BinaryDocumentDeserializer::from_reader(&mut doc_bytes, self.doc_store_version)
-                .map_err(crate::TantivyError::from)?;
+        let checkpoint = self.block_checkpoint(doc_id)?;
+        let (block, remap) = self.read_block_with_remap(&checkpoint)?;
+        let mut doc_bytes = Self::get_document_bytes_from_block(block, doc_id, &checkpoint)?;
+        let remap_ref = if remap.is_empty() { None } else { Some(&remap) };
+        let deserializer = BinaryDocumentDeserializer::from_reader_with_remap(
+            &mut doc_bytes,
+            self.doc_store_version,
+            remap_ref,
+        )
+        .map_err(crate::TantivyError::from)?;
         D::deserialize(deserializer).map_err(crate::TantivyError::from)
     }
 
@@ -278,13 +344,74 @@ impl StoreReader {
         &'b self,
         alive_bitset: Option<&'a AliveBitSet>,
     ) -> impl Iterator<Item = crate::Result<D>> + 'b {
-        self.iter_raw(alive_bitset).map(|doc_bytes_res| {
-            let mut doc_bytes = doc_bytes_res?;
+        self.iter_raw_with_remap(alive_bitset)
+            .map(|res| {
+                let (mut doc_bytes, remap) = res?;
+                let remap_ref = if remap.is_empty() { None } else { Some(&remap) };
+                let deserializer = BinaryDocumentDeserializer::from_reader_with_remap(
+                    &mut doc_bytes,
+                    self.doc_store_version,
+                    remap_ref,
+                )
+                .map_err(crate::TantivyError::from)?;
+                D::deserialize(deserializer).map_err(crate::TantivyError::from)
+            })
+    }
 
-            let deserializer =
-                BinaryDocumentDeserializer::from_reader(&mut doc_bytes, self.doc_store_version)
-                    .map_err(crate::TantivyError::from)?;
-            D::deserialize(deserializer).map_err(crate::TantivyError::from)
+    /// Internal: iterate raw doc bytes paired with their block's remap.
+    /// Used to feed [`iter`] so each doc record's field ids are translated
+    /// against the right per-block table.
+    fn iter_raw_with_remap<'a: 'b, 'b>(
+        &'b self,
+        alive_bitset: Option<&'a AliveBitSet>,
+    ) -> impl Iterator<Item = crate::Result<(OwnedBytes, super::block_trailer::BlockFieldRemap)>> + 'b
+    {
+        let last_doc_id = self
+            .block_checkpoints()
+            .last()
+            .map(|checkpoint| checkpoint.doc_range.end)
+            .unwrap_or(0);
+        let mut checkpoint_block_iter = self.block_checkpoints();
+        let mut curr_checkpoint = checkpoint_block_iter.next();
+        // load_block returns (block_bytes, remap) for the current checkpoint.
+        let load_block = |cp: Option<&Checkpoint>| {
+            cp.map(|checkpoint| {
+                self.read_block_with_remap(checkpoint)
+                    .map_err(|e| e.kind())
+            })
+        };
+        let mut curr_block = load_block(curr_checkpoint.as_ref());
+        let mut doc_pos = 0u32;
+        (0..last_doc_id).filter_map(move |doc_id| {
+            if doc_id >= curr_checkpoint.as_ref().unwrap().doc_range.end {
+                curr_checkpoint = checkpoint_block_iter.next();
+                curr_block = load_block(curr_checkpoint.as_ref());
+                doc_pos = 0;
+            }
+            let alive = alive_bitset
+                .map(|bitset| bitset.is_alive(doc_id))
+                .unwrap_or(true);
+            let res = if alive {
+                Some((curr_block.clone(), doc_pos))
+            } else {
+                None
+            };
+            doc_pos += 1;
+            res
+        })
+        .map(move |(block, doc_pos)| {
+            let (block_bytes, remap) = block
+                .ok_or_else(|| {
+                    DataCorruption::comment_only(
+                        "the current checkpoint in the doc store iterator is none, this \
+                         should never happen",
+                    )
+                })?
+                .map_err(|error_kind| {
+                    std::io::Error::new(error_kind, "error when reading block in doc store")
+                })?;
+            let range = block_read_index(&block_bytes, doc_pos)?;
+            Ok((block_bytes.slice(range), remap))
         })
     }
 
@@ -499,7 +626,9 @@ mod tests {
         assert_eq!(store.cache_stats().cache_hits, 1);
         assert_eq!(store.cache_stats().cache_misses, 2);
 
-        assert_eq!(store.cache.peek_lru(), Some(232206));
+        // Each V3 block carries an extra 4-byte trailer (empty remap),
+        // shifting every block's start offset by 4 bytes per preceding block.
+        assert_eq!(store.cache.peek_lru(), Some(232262));
 
         Ok(())
     }

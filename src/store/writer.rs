@@ -130,6 +130,29 @@ impl StoreWriter {
         Ok(())
     }
 
+    /// Stack a store reader with a per-block field-id remap. The compressed
+    /// payload of every source block is byte-copied into the target store;
+    /// only the V3 trailer is rewritten to carry the new remap. This is the
+    /// fast cross-schema re-segmenter path — no decompression, no
+    /// recompression, no per-doc field rewrite.
+    ///
+    /// `remap` should map each `encoded` field id appearing in the source's
+    /// docs to the target schema's field id. For freshly-written V3 sources
+    /// (the common case) the encoded ids ARE the source schema's field ids,
+    /// so the caller can construct `remap` directly from a `source_field_id
+    /// → target_field_id` table. Encoded ids not in `remap` fall through to
+    /// identity at read time.
+    pub fn stack_with_remap(
+        &mut self,
+        store_reader: StoreReader,
+        remap: crate::store::BlockFieldRemap,
+    ) -> io::Result<()> {
+        self.send_current_block_to_compressor()?;
+        self.block_compressor
+            .stack_reader_with_remap(store_reader, remap)?;
+        Ok(())
+    }
+
     /// Finalized the store writer.
     ///
     /// Compress the last unfinished block if any,
