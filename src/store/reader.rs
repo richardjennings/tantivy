@@ -509,20 +509,36 @@ impl StoreReader {
         let target_field_count = target_schema.fields().count() as u32;
         self.iter_raw_with_remap(alive_bitset).map(move |res| {
             let (mut doc_bytes, remap) = res?;
-            if remap.is_empty() {
+            // is_identity() also catches the rare case where every
+            // (encoded, target) pair has encoded == target — the remap is
+            // structurally non-empty but functionally a no-op, so the
+            // decode/re-encode round-trip is pure overhead.
+            if remap.is_empty() || remap.is_identity() {
                 return Ok(doc_bytes.as_slice().to_vec());
             }
             // Validate the remap doesn't translate any encoded id to a
-            // target id that's out of range for `target_schema`. Without
-            // this guard, `BinaryDocumentSerializer::serialize_doc` would
-            // call `Schema::get_field_entry` (an unchecked Vec index) and
-            // panic, taking down the merge thread mid-run.
+            // target id that's out of range for `target_schema` (panic
+            // prevention) or non-stored in the target (silent data drop
+            // prevention). `BinaryDocumentSerializer::serialize_doc`
+            // filters out non-stored fields when writing — without this
+            // check, a value that lives in the source's stored bytes
+            // would simply vanish during translation.
             for (encoded, target) in remap.pairs() {
                 if target >= target_field_count {
                     return Err(crate::TantivyError::SchemaError(format!(
                         "iter_doc_bytes_translated: remap entry {encoded} \
                          → {target} targets a field id outside the target \
                          schema's {target_field_count}-field range"
+                    )));
+                }
+                let target_field = crate::schema::Field::from_field_id(target);
+                if !target_schema.get_field_entry(target_field).is_stored() {
+                    return Err(crate::TantivyError::SchemaError(format!(
+                        "iter_doc_bytes_translated: remap entry {encoded} \
+                         → {target} targets non-stored field {:?}; the \
+                         serializer would silently drop the value. Either \
+                         mark the target field STORED or omit this entry.",
+                        target_schema.get_field_entry(target_field).name(),
                     )));
                 }
             }
@@ -587,8 +603,28 @@ impl StoreReader {
                 tail.as_slice()[2],
                 tail.as_slice()[3],
             ]) as usize;
-            // 4 == empty trailer (just the u32 length itself).
-            if trailer_byte_len > 4 {
+            if trailer_byte_len <= 4 {
+                // Empty trailer (just the u32 length itself) — definitely
+                // identity. Skip the body read.
+                continue;
+            }
+            // Non-empty trailer; the body could still be functionally
+            // identity (every encoded == target pair). Read the body and
+            // call `is_identity()` to find out, sparing the merger's slow
+            // path when the translation is a no-op.
+            let body_start = checkpoint.byte_range.end - trailer_byte_len;
+            let body_range = body_start..(checkpoint.byte_range.end - 4);
+            let Ok(body_bytes) = self.data.slice(body_range).read_bytes() else {
+                return true;
+            };
+            let body_len = trailer_byte_len - 4;
+            let Ok(remap) = super::block_trailer::BlockFieldRemap::deserialize_body(
+                &mut body_bytes.as_slice(),
+                body_len,
+            ) else {
+                return true;
+            };
+            if !remap.is_identity() {
                 return true;
             }
         }

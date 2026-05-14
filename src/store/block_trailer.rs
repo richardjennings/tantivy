@@ -103,7 +103,16 @@ impl BlockFieldRemap {
             return Ok(BlockFieldRemap::default());
         }
         let num_pairs = VInt::deserialize(reader)?.0 as usize;
-        let mut map = HashMap::with_capacity(num_pairs);
+        // Each pair is two varints; even the minimum (1-byte) encoding
+        // requires 2 bytes per pair, so a body of `body_len` bytes can
+        // carry at most `body_len / 2` pairs (in practice far fewer
+        // because the leading num_pairs varint consumes ≥ 1 byte). Cap
+        // `with_capacity` to the on-disk maximum so a corrupt or hostile
+        // num_pairs varint (e.g. 2^60) can't trigger an OOM allocation
+        // before the loop discovers the read past EOF.
+        let cap_upper_bound = body_len / 2;
+        let map_cap = num_pairs.min(cap_upper_bound);
+        let mut map = HashMap::with_capacity(map_cap);
         for _ in 0..num_pairs {
             let encoded = VInt::deserialize(reader)?.0 as u32;
             let target = VInt::deserialize(reader)?.0 as u32;

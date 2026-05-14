@@ -729,12 +729,17 @@ impl Index {
         }
 
         // Persist. `save_metas` is `pub(crate)` so we use it directly here.
+        // Order matters on failure: if `sync_directory` errors AFTER the
+        // in-memory swap, callers see an old `self.schema` and the next
+        // commit (which reads `current_schema`) writes the OLD schema
+        // back to meta.json — silently reverting the now-durably-flushed
+        // extension. Swap in-memory FIRST so a sync failure leaves the
+        // in-memory view consistent with the new on-disk meta.json.
         let mut meta = self.load_metas()?;
         meta.schema = new_schema.clone();
         crate::indexer::save_metas(&meta, &self.directory)?;
-        self.directory.sync_directory()?;
-
         self.schema = new_schema;
+        self.directory.sync_directory()?;
         Ok(())
     }
 
