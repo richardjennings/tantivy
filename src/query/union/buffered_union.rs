@@ -269,22 +269,39 @@ where
         if target >= TERMINATED {
             return SeekDangerResult::SeekLowerBound(TERMINATED);
         }
+        // The bug fix is this guard. The union may already be positioned
+        // at or beyond the target — its sliding window re-anchored ahead
+        // on a prior refill, with buffered matches still in hand. In that
+        // case the union's own `doc` is authoritative; forwarding
+        // seek_danger into the children (which sit up to a full horizon
+        // ahead after a refill) would fabricate a lower bound past those
+        // buffered matches and make an intersection driver leap over
+        // them. Answer from self, exactly as the trait default would.
+        // Without this, a `Must(term) AND union` query silently lost
+        // every match between a horizon boundary and the children's
+        // parked positions (facet aggregations undercounted; Count took a
+        // different path and stayed correct).
+        if self.doc >= target {
+            if self.doc == target {
+                return SeekDangerResult::Found;
+            }
+            return SeekDangerResult::SeekLowerBound(self.doc);
+        }
         if self.is_in_horizon(target) {
-            // Our value is within the buffered horizon and the docset may already have been
-            // processed and removed, so we need to use seek, which uses the regular advance.
+            // Within the buffered horizon: a normal seek is cheap and
+            // leaves the union valid.
             let seek_doc = self.seek(target);
             if seek_doc == target {
                 return SeekDangerResult::Found;
-            } else {
-                return SeekDangerResult::SeekLowerBound(seek_doc);
-            };
+            }
+            return SeekDangerResult::SeekLowerBound(seek_doc);
         }
-
-        // The docsets are not in the buffered range, so we can use seek_into_the_danger_zone
-        // of the underlying docsets
+        // The target is genuinely ahead of our buffered window: this is
+        // the danger-zone optimisation (upstream's faster-exclude path).
+        // Probe the children directly. On a hit we resync via self.seek,
+        // which rebuilds the window from the children's real positions.
         let mut is_hit = false;
         let mut min_new_target = TERMINATED;
-
         for docset in self.docsets.iter_mut() {
             match docset.seek_danger(target) {
                 SeekDangerResult::Found => {
@@ -296,12 +313,7 @@ where
                 }
             }
         }
-
-        // The API requires the DocSet to be in a valid state when `seek_into_the_danger_zone`
-        // returns Found.
         if is_hit {
-            // The doc is found. Let's make sure we position the union on the target
-            // to bring it back to a valid state.
             self.seek(target);
             SeekDangerResult::Found
         } else {
