@@ -103,6 +103,9 @@ pub enum MetricResult {
     TopHits(TopHitsMetricResult),
     /// Cardinality metric result
     Cardinality(SingleMetricResult),
+    /// Segment-cardinality metric result: sum over segments of the
+    /// exact per-segment distinct count.
+    SegmentCardinality(SingleMetricResult),
 }
 
 impl MetricResult {
@@ -122,6 +125,7 @@ impl MetricResult {
                 AggregationError::InvalidRequest("top_hits can't be used to order".to_string()),
             )),
             MetricResult::Cardinality(card) => Ok(card.value),
+            MetricResult::SegmentCardinality(card) => Ok(card.value),
         }
     }
 }

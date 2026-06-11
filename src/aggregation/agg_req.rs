@@ -37,8 +37,8 @@ use super::bucket::{
 };
 use super::metric::{
     AverageAggregation, CardinalityAggregationReq, CountAggregation, ExtendedStatsAggregation,
-    MaxAggregation, MinAggregation, PercentilesAggregationReq, StatsAggregation, SumAggregation,
-    TopHitsAggregationReq,
+    MaxAggregation, MinAggregation, PercentilesAggregationReq, SegmentDistinctAggReq,
+    StatsAggregation, SumAggregation, TopHitsAggregationReq,
 };
 
 /// The top-level aggregation request structure, which contains [`Aggregation`] and their user
@@ -172,6 +172,13 @@ pub enum AggregationVariants {
     /// Computes an estimate of the number of unique values
     #[serde(rename = "cardinality")]
     Cardinality(CardinalityAggregationReq),
+    /// Computes the exact per-segment distinct value count, summed
+    /// across segments. Identity is segment-local (no dictionary
+    /// access), making it exact on single-segment indexes and
+    /// correct under intra-segment doc-range partitioning. Top-level
+    /// placement only; `missing` unsupported.
+    #[serde(rename = "segment_cardinality")]
+    SegmentCardinality(SegmentDistinctAggReq),
 }
 
 impl AggregationVariants {
@@ -198,6 +205,7 @@ impl AggregationVariants {
             AggregationVariants::Percentiles(per) => vec![per.field_name()],
             AggregationVariants::TopHits(top_hits) => top_hits.field_names(),
             AggregationVariants::Cardinality(per) => vec![per.field_name()],
+            AggregationVariants::SegmentCardinality(per) => vec![per.field_name()],
         }
     }
 

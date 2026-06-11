@@ -19,7 +19,8 @@ use crate::aggregation::bucket::{
 use crate::aggregation::metric::{
     build_segment_stats_collector, AverageAggregation, CardinalityAggReqData,
     CardinalityAggregationReq, CountAggregation, ExtendedStatsAggregation, MaxAggregation,
-    MetricAggReqData, MinAggregation, SegmentCardinalityCollector, SegmentExtendedStatsCollector,
+    MetricAggReqData, MinAggregation, SegmentCardinalityCollector, SegmentDistinctAggReqData,
+    SegmentDistinctCollector, SegmentExtendedStatsCollector,
     SegmentPercentilesCollector, StatsAggregation, StatsType, SumAggregation, TermOrdSet,
     TopHitsAggReqData, TopHitsSegmentCollector, BITSET_MAX_TERM_ORD,
 };
@@ -47,6 +48,16 @@ impl AggregationsSegmentCtx {
     pub(crate) fn push_cardinality_req_data(&mut self, data: CardinalityAggReqData) -> usize {
         self.per_request.cardinality_req_data.push(data);
         self.per_request.cardinality_req_data.len() - 1
+    }
+    pub(crate) fn push_segment_distinct_req_data(
+        &mut self,
+        data: SegmentDistinctAggReqData,
+    ) -> usize {
+        self.per_request.segment_distinct_req_data.push(data);
+        self.per_request.segment_distinct_req_data.len() - 1
+    }
+    pub(crate) fn get_segment_distinct_req_data(&self, idx: usize) -> &SegmentDistinctAggReqData {
+        &self.per_request.segment_distinct_req_data[idx]
     }
     pub(crate) fn push_metric_req_data(&mut self, data: MetricAggReqData) -> usize {
         self.per_request.stats_metric_req_data.push(data);
@@ -236,6 +247,8 @@ pub struct PerRequestAggSegCtx {
     pub stats_metric_req_data: Vec<MetricAggReqData>,
     /// CardinalityAggReqData contains the request data for a cardinality aggregation.
     pub cardinality_req_data: Vec<CardinalityAggReqData>,
+    /// SegmentDistinctAggReqData contains the request data for a segment_cardinality aggregation.
+    pub segment_distinct_req_data: Vec<SegmentDistinctAggReqData>,
     /// TopHitsAggReqData contains the request data for a top_hits aggregation.
     pub top_hits_req_data: Vec<TopHitsAggReqData>,
     /// MissingTermAggReqData contains the request data for a missing term aggregation.
@@ -280,6 +293,11 @@ impl PerRequestAggSegCtx {
                 .map(|t| t.get_memory_consumption())
                 .sum::<usize>()
             + self
+                .segment_distinct_req_data
+                .iter()
+                .map(|t| t.get_memory_consumption())
+                .sum::<usize>()
+            + self
                 .top_hits_req_data
                 .iter()
                 .map(|t| t.get_memory_consumption())
@@ -307,6 +325,7 @@ impl PerRequestAggSegCtx {
                 .name
                 .as_str(),
             AggKind::Cardinality => &self.cardinality_req_data[idx].name,
+            AggKind::SegmentCardinality => &self.segment_distinct_req_data[idx].name,
             AggKind::StatsKind(_) => &self.stats_metric_req_data[idx].name,
             AggKind::TopHits => &self.top_hits_req_data[idx].name,
             AggKind::MissingTerm => &self.missing_term_req_data[idx].name,
@@ -446,6 +465,13 @@ pub(crate) fn build_segment_agg_collector(
                 };
             Ok(collector)
         }
+        AggKind::SegmentCardinality => {
+            let req_data = req.get_segment_distinct_req_data(node.idx_in_req_data);
+            Ok(Box::new(SegmentDistinctCollector::from_req_data(
+                node.idx_in_req_data,
+                req_data,
+            )))
+        }
         AggKind::StatsKind(stats_type) => {
             let req_data = &mut req.per_request.stats_metric_req_data[node.idx_in_req_data];
             match stats_type {
@@ -514,6 +540,7 @@ impl AggRefNode {
 pub enum AggKind {
     Terms,
     Cardinality,
+    SegmentCardinality,
     /// One of: Statistics, Average, Min, Max, Sum, Count, Stats, ExtendedStats
     StatsKind(StatsType),
     TopHits,
@@ -531,6 +558,7 @@ impl AggKind {
         match self {
             AggKind::Terms => "Terms",
             AggKind::Cardinality => "Cardinality",
+            AggKind::SegmentCardinality => "SegmentCardinality",
             AggKind::StatsKind(_) => "Metric",
             AggKind::TopHits => "TopHits",
             AggKind::MissingTerm => "MissingTerm",
@@ -665,6 +693,47 @@ fn build_nodes(
             TermsOrCardinalityRequest::Cardinality(card_req.clone()),
             is_top_level,
         ),
+        SegmentCardinality(sd_req) => {
+            if !is_top_level {
+                return Err(crate::TantivyError::InvalidArgument(
+                    "segment_cardinality is only supported as a top-level aggregation"
+                        .to_string(),
+                ));
+            }
+            if sd_req.missing.is_some() {
+                return Err(crate::TantivyError::InvalidArgument(
+                    "the missing parameter is not supported by segment_cardinality".to_string(),
+                ));
+            }
+            if !req.sub_aggregation.is_empty() {
+                return Err(crate::TantivyError::InvalidArgument(
+                    "sub-aggregations are not supported under segment_cardinality".to_string(),
+                ));
+            }
+            let column_and_types = get_term_agg_accessors(reader, &sd_req.field, &None)?;
+            let segment_id = reader.segment_id();
+            let mut nodes = Vec::new();
+            // One node per column (JSON dynamic fields may carry
+            // several column types under one name); their fruits
+            // merge componentwise under the aggregation name.
+            for (accessor, column_type) in column_and_types {
+                let idx_in_req_data = data.push_segment_distinct_req_data(
+                    SegmentDistinctAggReqData {
+                        accessor,
+                        column_type,
+                        name: agg_name.to_string(),
+                        segment_id,
+                        req: sd_req.clone(),
+                    },
+                );
+                nodes.push(AggRefNode {
+                    kind: AggKind::SegmentCardinality,
+                    idx_in_req_data,
+                    children: Vec::new(),
+                });
+            }
+            Ok(nodes)
+        }
         Average(AverageAggregation { field, missing, .. })
         | Max(MaxAggregation { field, missing, .. })
         | Min(MinAggregation { field, missing, .. })

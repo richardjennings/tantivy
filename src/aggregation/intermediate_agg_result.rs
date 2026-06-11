@@ -30,6 +30,7 @@ use crate::aggregation::agg_result::{
 };
 use crate::aggregation::bucket::TermsAggregationInternal;
 use crate::aggregation::metric::CardinalityCollector;
+use crate::aggregation::metric::IntermediateSegmentDistinct;
 use crate::TantivyError;
 
 /// Contains the intermediate aggregation result, which is optimized to be merged with other
@@ -277,6 +278,9 @@ pub(crate) fn empty_from_req(req: &Aggregation) -> IntermediateAggregationResult
         Cardinality(_) => IntermediateAggregationResult::Metric(
             IntermediateMetricResult::Cardinality(CardinalityCollector::default()),
         ),
+        SegmentCardinality(_) => IntermediateAggregationResult::Metric(
+            IntermediateMetricResult::SegmentDistinct(IntermediateSegmentDistinct::default()),
+        ),
         Filter(_) => IntermediateAggregationResult::Bucket(IntermediateBucketResult::Filter {
             doc_count: 0,
             sub_aggregations: IntermediateAggregationResults::default(),
@@ -353,6 +357,9 @@ pub enum IntermediateMetricResult {
     TopHits(TopHitsTopNComputer),
     /// Intermediate cardinality result
     Cardinality(CardinalityCollector),
+    /// Intermediate segment_cardinality result: per-SegmentId
+    /// distinct sets, union-merged (partition- and segment-keyed).
+    SegmentDistinct(IntermediateSegmentDistinct),
 }
 
 impl IntermediateMetricResult {
@@ -388,6 +395,9 @@ impl IntermediateMetricResult {
             }
             IntermediateMetricResult::Cardinality(cardinality) => {
                 MetricResult::Cardinality(cardinality.finalize().into())
+            }
+            IntermediateMetricResult::SegmentDistinct(segment_distinct) => {
+                MetricResult::SegmentCardinality(Some(segment_distinct.finalize()).into())
             }
         }
     }
@@ -440,6 +450,12 @@ impl IntermediateMetricResult {
             (
                 IntermediateMetricResult::Cardinality(left),
                 IntermediateMetricResult::Cardinality(right),
+            ) => {
+                left.merge_fruits(right)?;
+            }
+            (
+                IntermediateMetricResult::SegmentDistinct(left),
+                IntermediateMetricResult::SegmentDistinct(right),
             ) => {
                 left.merge_fruits(right)?;
             }
