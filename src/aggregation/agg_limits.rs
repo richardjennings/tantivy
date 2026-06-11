@@ -34,6 +34,11 @@ pub struct AggregationLimitsGuard {
     bucket_limit: u32,
     /// Allocated memory with this guard.
     allocated_with_the_guard: u64,
+    /// Test-only high-water mark of the shared counter — lets tests
+    /// assert storage-selection memory behaviour without exposing
+    /// production API.
+    #[cfg(test)]
+    peak_memory: Arc<AtomicU64>,
 }
 
 impl Clone for AggregationLimitsGuard {
@@ -43,6 +48,8 @@ impl Clone for AggregationLimitsGuard {
             memory_limit: self.memory_limit,
             bucket_limit: self.bucket_limit,
             allocated_with_the_guard: 0,
+            #[cfg(test)]
+            peak_memory: Arc::clone(&self.peak_memory),
         }
     }
 }
@@ -63,6 +70,8 @@ impl Default for AggregationLimitsGuard {
             memory_limit: DEFAULT_MEMORY_LIMIT.into(),
             bucket_limit: DEFAULT_BUCKET_LIMIT,
             allocated_with_the_guard: 0,
+            #[cfg(test)]
+            peak_memory: Default::default(),
         }
     }
 }
@@ -85,6 +94,8 @@ impl AggregationLimitsGuard {
             memory_limit: memory_limit.unwrap_or(DEFAULT_MEMORY_LIMIT).into(),
             bucket_limit: bucket_limit.unwrap_or(DEFAULT_BUCKET_LIMIT),
             allocated_with_the_guard: 0,
+            #[cfg(test)]
+            peak_memory: Default::default(),
         }
     }
 
@@ -92,9 +103,19 @@ impl AggregationLimitsGuard {
         let prev_value = self
             .memory_consumption
             .fetch_add(add_num_bytes, Ordering::Relaxed);
+        #[cfg(test)]
+        self.peak_memory
+            .fetch_max(prev_value + add_num_bytes, Ordering::Relaxed);
         self.allocated_with_the_guard += add_num_bytes;
         validate_memory_consumption(prev_value + add_num_bytes, self.memory_limit)?;
         Ok(())
+    }
+
+    /// High-water mark of the shared memory counter across the
+    /// request this guard belongs to. Test-only.
+    #[cfg(test)]
+    pub(crate) fn peak_memory_for_tests(&self) -> u64 {
+        self.peak_memory.load(Ordering::Relaxed)
     }
 
     pub(crate) fn get_bucket_limit(&self) -> u32 {

@@ -34,6 +34,44 @@ pub(crate) fn for_each_docset_buffered<T: DocSet + ?Sized>(
     }
 }
 
+/// Iterates through the documents matched by the DocSet within the
+/// doc-id window `[start, end)`, delivering them in blocks.
+///
+/// The bounded sibling of [`for_each_docset_buffered`]: blocks are
+/// produced through `DocSet::fill_buffer`, so per-docset
+/// specializations (e.g. `AllScorer`'s bulk fill,
+/// `BufferedUnionScorer`'s bitset drain) are preserved; the final
+/// block is truncated at the first doc >= `end`. The docset is
+/// expected to be freshly positioned on its first match; this
+/// function seeks to `start` when positioned before it. The
+/// callback returns a `Result` so callers can abort the drive
+/// (cooperative cancellation) between blocks.
+#[inline]
+pub(crate) fn for_each_docset_buffered_range<T: DocSet + ?Sized>(
+    docset: &mut T,
+    buffer: &mut [DocId; COLLECT_BLOCK_BUFFER_LEN],
+    start: DocId,
+    end: DocId,
+    mut callback: impl FnMut(&[DocId]) -> crate::Result<()>,
+) -> crate::Result<()> {
+    if docset.doc() != TERMINATED && docset.doc() < start {
+        docset.seek(start);
+    }
+    loop {
+        let num_items = docset.fill_buffer(buffer);
+        let filled = &buffer[..num_items];
+        // Docs within a block ascend: cut at the first doc >= end.
+        let cut = filled.partition_point(|&doc| doc < end);
+        if cut > 0 {
+            callback(&filled[..cut])?;
+        }
+        if cut < num_items || num_items != buffer.len() {
+            break;
+        }
+    }
+    Ok(())
+}
+
 /// Calls `callback` with all of the `(doc, score)` for which score
 /// is exceeding a given threshold.
 ///

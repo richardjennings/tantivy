@@ -406,7 +406,16 @@ pub(crate) fn build_segment_term_collector(
             terms_req_data,
         };
         Ok(Box::new(collector))
-    } else if max_term_id < 8_000_000 && is_top_level {
+    } else if max_term_id < 8_000_000
+        && is_top_level
+        && req_data.context.partition_docs.is_none()
+    {
+        // PagedTermMap sizes by the COLUMN's max term id — identical
+        // in every doc-range partition of a segment. Under
+        // intra-segment partitioning (partition_docs set), K
+        // concurrent partitions would each allocate the full dense
+        // map (~K x memory); the hashmap branch below scales with
+        // values actually observed per partition instead.
         let term_buckets: PagedTermMap =
             PagedTermMap::new(max_term_id + 1, &mut bucket_id_provider);
         // Build sub-aggregation blueprint (flat pairs)
@@ -421,7 +430,20 @@ pub(crate) fn build_segment_term_collector(
             };
         Ok(Box::new(collector))
     } else {
-        let term_buckets: HashMapTermBuckets = HashMapTermBuckets::default();
+        // Reserve up front when partitioned: the K equal-sized
+        // partitions would otherwise cross their final hashbrown
+        // doubling near-simultaneously (transient ~2x spike per
+        // map). Observed distinct is bounded by both the partition's
+        // doc count (x values per doc notwithstanding, a sane
+        // estimate) and the column's term-id space.
+        let term_buckets: HashMapTermBuckets =
+            if let Some(partition_docs) = req_data.context.partition_docs {
+                HashMapTermBuckets::with_capacity(
+                    (partition_docs as u64).min(max_term_id + 1) as usize,
+                )
+            } else {
+                HashMapTermBuckets::default()
+            };
         // Build sub-aggregation blueprint (flat pairs)
         let sub_agg = sub_agg_collector.map(BufferedSubAggs::new);
         let collector: SegmentTermCollector<HashMapTermBuckets, HighCardSubAggBuffer> =
@@ -478,6 +500,17 @@ impl Default for HashMapTermBuckets {
     fn default() -> Self {
         Self {
             bucket_map: FxHashMap::default(),
+        }
+    }
+}
+
+impl HashMapTermBuckets {
+    /// Pre-sized constructor for partitioned execution: avoids the
+    /// rehash-doubling transient that K equal-sized partitions would
+    /// otherwise all hit near-simultaneously.
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            bucket_map: FxHashMap::with_capacity_and_hasher(capacity, Default::default()),
         }
     }
 }

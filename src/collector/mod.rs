@@ -116,6 +116,9 @@ pub use self::docset_collector::DocSetCollector;
 mod filter_collector_wrapper;
 pub use self::filter_collector_wrapper::{BytesFilterCollector, FilterCollector};
 
+#[cfg(test)]
+mod partition_tests;
+
 /// `Fruit` is the type for the result of our collection.
 /// e.g. `usize` for the `Count` collector.
 pub trait Fruit: Send + downcast_rs::Downcast {}
@@ -181,6 +184,46 @@ pub trait Collector: Sync + Send {
         default_collect_segment_impl(&mut segment_collector, weight, reader, with_scoring)?;
         Ok(segment_collector.harvest())
     }
+
+    /// Collects one doc-id partition of a segment — the
+    /// intra-segment concurrency unit (analogous to Lucene's
+    /// `LeafReaderContextPartition`). Running K partitions of one
+    /// segment and merging their fruits via [`Collector::merge_fruits`]
+    /// is equivalent to collecting K distinct segments: fruits are
+    /// source-agnostic.
+    ///
+    /// `should_stop` is checked once per collected block; when it
+    /// becomes true, collection aborts with an error (cooperative
+    /// cancellation).
+    ///
+    /// Scoring collectors are not supported yet: callers get an
+    /// explicit error rather than silently wrong results. Note also
+    /// that collectors overriding [`Collector::collect_segment`]
+    /// with specialized drives (e.g. `Count`) do not have those
+    /// specializations applied here — this default drive is generic.
+    fn collect_segment_partition(
+        &self,
+        weight: &dyn Weight,
+        segment_ord: u32,
+        reader: &SegmentReader,
+        doc_range: std::ops::Range<DocId>,
+        should_stop: Option<&std::sync::atomic::AtomicBool>,
+    ) -> crate::Result<<Self::Child as SegmentCollector>::Fruit> {
+        if self.requires_scoring() {
+            return Err(crate::TantivyError::InternalError(
+                "collect_segment_partition does not support scoring collectors yet".to_string(),
+            ));
+        }
+        let mut segment_collector = self.for_segment(segment_ord, reader)?;
+        collect_segment_partition_impl(
+            &mut segment_collector,
+            weight,
+            reader,
+            doc_range,
+            should_stop,
+        )?;
+        Ok(segment_collector.harvest())
+    }
 }
 
 pub(crate) fn default_collect_segment_impl<TSegmentCollector: SegmentCollector>(
@@ -215,6 +258,73 @@ pub(crate) fn default_collect_segment_impl<TSegmentCollector: SegmentCollector>(
             weight.for_each_no_score(reader, &mut |docs| {
                 segment_collector.collect_block(docs);
             })?;
+        }
+    }
+    Ok(())
+}
+
+/// [`default_collect_segment_impl`] restricted to a `[start, end)`
+/// doc-id window, with an optional cancellation flag checked once
+/// per block. No-score paths only: scoring partitions are rejected
+/// by [`Collector::collect_segment_partition`] before reaching this
+/// drive. Blocks are produced through `DocSet::fill_buffer` (via
+/// [`for_each_docset_buffered_range`]), preserving per-docset fill
+/// specializations; the alive arm filters each block before
+/// delivery, mirroring the unwindowed impl's per-doc collect.
+pub(crate) fn collect_segment_partition_impl<TSegmentCollector: SegmentCollector>(
+    segment_collector: &mut TSegmentCollector,
+    weight: &dyn Weight,
+    reader: &SegmentReader,
+    doc_range: std::ops::Range<DocId>,
+    should_stop: Option<&std::sync::atomic::AtomicBool>,
+) -> crate::Result<()> {
+    use std::sync::atomic::Ordering;
+
+    use crate::docset::COLLECT_BLOCK_BUFFER_LEN;
+    use crate::query::for_each_docset_buffered_range;
+
+    fn cancelled() -> crate::TantivyError {
+        crate::TantivyError::InternalError("collection cancelled".to_string())
+    }
+    let stop_requested =
+        |flag: Option<&std::sync::atomic::AtomicBool>| flag.is_some_and(|s| s.load(Ordering::Relaxed));
+
+    let mut scorer = weight.scorer(reader, 1.0)?;
+    let mut buffer = [0u32; COLLECT_BLOCK_BUFFER_LEN];
+    match reader.alive_bitset() {
+        Some(alive_bitset) => {
+            for_each_docset_buffered_range(
+                scorer.as_mut(),
+                &mut buffer,
+                doc_range.start,
+                doc_range.end,
+                |docs| {
+                    if stop_requested(should_stop) {
+                        return Err(cancelled());
+                    }
+                    for doc in docs.iter().cloned() {
+                        if alive_bitset.is_alive(doc) {
+                            segment_collector.collect(doc, 0.0);
+                        }
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+        None => {
+            for_each_docset_buffered_range(
+                scorer.as_mut(),
+                &mut buffer,
+                doc_range.start,
+                doc_range.end,
+                |docs| {
+                    if stop_requested(should_stop) {
+                        return Err(cancelled());
+                    }
+                    segment_collector.collect_block(docs);
+                    Ok(())
+                },
+            )?;
         }
     }
     Ok(())

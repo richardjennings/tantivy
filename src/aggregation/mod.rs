@@ -186,12 +186,26 @@ pub struct AggContextParams {
     pub limits: AggregationLimitsGuard,
     /// Tokenizer manager for query string parsing
     pub tokenizers: TokenizerManager,
+    /// `Some(n)` when this collector runs over a doc-id-range
+    /// partition of a segment holding roughly `n` docs
+    /// (intra-segment concurrency via
+    /// `Collector::collect_segment_partition`). Storage selectors
+    /// use the hint to prefer sparse, observed-value-sized
+    /// structures over dense column-spanning ones: K concurrent
+    /// partitions each allocating dense `max_ord`-sized state would
+    /// multiply memory by K, while sparse state splits it. `None`
+    /// (the default) selects exactly as before.
+    pub partition_docs: Option<u32>,
 }
 
 impl AggContextParams {
     /// Create new aggregation context parameters
     pub fn new(limits: AggregationLimitsGuard, tokenizers: TokenizerManager) -> Self {
-        Self { limits, tokenizers }
+        Self {
+            limits,
+            tokenizers,
+            partition_docs: None,
+        }
     }
 }
 
